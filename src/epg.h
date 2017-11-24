@@ -301,15 +301,12 @@ epg_season_t *epg_season_deserialize ( htsmsg_t *m, int create, int *save );
 #define EPG_CHANGED_FIRST_AIRED  (1<<(EPG_CHANGED_SLAST+12))
 #define EPG_CHANGED_BRAND        (1<<(EPG_CHANGED_SLAST+13))
 #define EPG_CHANGED_SEASON       (1<<(EPG_CHANGED_SLAST+14))
-<<<<<<< HEAD
-#define EPG_CHANGED_CAST         (1<<(EPG_CHANGED_SLAST+15))
-#define EPG_CHANGED_DIRECTOR     (1<<(EPG_CHANGED_SLAST+16))
-#define EPG_CHANGED_WRITER       (1<<(EPG_CHANGED_SLAST+17))
-#define EPG_CHANGED_YEAR         (1<<(EPG_CHANGED_SLAST+18))
-#define EPG_CHANGED_ORIG_TITLE   (1<<(EPG_CHANGED_SLAST+19))
-=======
 #define EPG_CHANGED_COPYRIGHT_YEAR (1<<(EPG_CHANGED_SLAST+15))
->>>>>>> upstream/master
+#define EPG_CHANGED_CAST         (1<<(EPG_CHANGED_SLAST+16))
+#define EPG_CHANGED_DIRECTOR     (1<<(EPG_CHANGED_SLAST+17))
+#define EPG_CHANGED_WRITER       (1<<(EPG_CHANGED_SLAST+18))
+#define EPG_CHANGED_YEAR         (1<<(EPG_CHANGED_SLAST+19))
+#define EPG_CHANGED_ORIG_TITLE   (1<<(EPG_CHANGED_SLAST+20))
 
 /* Episode numbering object - this is for some back-compat and also
  * to allow episode information to be "collated" into easy to use object

@@ -21,11 +21,8 @@
 #include "webui.h"
 #include "channels.h"
 #include "http.h"
-<<<<<<< HEAD
-#include "epg.h"
-=======
 #include "string_list.h"
->>>>>>> upstream/master
+#include "epg.h"
 
 /*
  *
@@ -137,7 +134,6 @@ http_xmltv_programme_one(htsbuf_queue_t *hq, const char *hostpath,
       htsbuf_append_and_escape_xml(hq, lse->str);
       htsbuf_append_str(hq, "</desc>\n");
     }
-<<<<<<< HEAD
   LIST_FOREACH(genre, &e->genre, link) {
     if (genre && genre->code) {
       epg_genre_get_str(genre, 0, 1, buf, sizeof(buf), "en");
@@ -146,7 +142,6 @@ http_xmltv_programme_one(htsbuf_queue_t *hq, const char *hostpath,
       htsbuf_append_str(hq, "</category>\n");
     }
   }
-=======
   if (ebc->credits) {
     htsbuf_append_str(hq, "  <credits>\n");
     htsmsg_field_t *f;
@@ -159,7 +154,6 @@ http_xmltv_programme_one(htsbuf_queue_t *hq, const char *hostpath,
   }
   _http_xmltv_programme_write_string_list(hq, ebc->category, "category");
   _http_xmltv_programme_write_string_list(hq, ebc->keyword, "keyword");
->>>>>>> upstream/master
   htsbuf_append_str(hq, "</programme>\n");
 }
 
