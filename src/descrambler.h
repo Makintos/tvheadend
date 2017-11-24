@@ -46,6 +46,7 @@ typedef enum {
     DS_READY,
     DS_RESOLVED,
     DS_FORBIDDEN,
+    DS_FATAL,
     DS_IDLE
 } th_descrambler_keystate_t;
 
@@ -85,10 +86,14 @@ typedef struct th_descrambler_key {
 } th_descrambler_key_t;
 
 typedef struct th_descrambler_runtime {
+  th_descrambler_t *dr_descrambler;
   struct service *dr_service;
+  int    (*dr_descramble)(struct service *t, struct elementary_stream *st,
+                          const uint8_t *tsb, int len);
   int      dr_ca_count;
   int      dr_ca_resolved;
   int      dr_ca_failed;
+  int      dr_ca_fatal;
   uint32_t dr_external:1;
   uint32_t dr_skip:1;
   uint32_t dr_quick_ecm:1;
@@ -142,14 +147,13 @@ typedef struct descrambler_table {
 /**
  * List of CA ids
  */
-#define CAID_REMOVE_ME ((uint16_t)-1)
-
 typedef struct caid {
   LIST_ENTRY(caid) link;
 
   uint16_t pid;
   uint16_t caid;
   uint32_t providerid;
+  uint8_t  delete_me;
   uint8_t  use;
   uint8_t  filter;
 
@@ -184,7 +188,6 @@ void descrambler_service_start ( struct service *t );
 void descrambler_service_stop  ( struct service *t );
 void descrambler_caid_changed  ( struct service *t );
 int  descrambler_resolved      ( struct service *t, th_descrambler_t *ignore );
-void descrambler_external      ( struct service *t, int state );
 int  descrambler_multi_pid     ( th_descrambler_t *t );
 void descrambler_keys          ( th_descrambler_t *t, int type, uint16_t pid,
                                  const uint8_t *even, const uint8_t *odd );
@@ -193,6 +196,8 @@ void descrambler_notify        ( th_descrambler_t *t,
                                  const char *cardsystem, uint16_t pid, uint32_t ecmtime,
                                  uint16_t hops, const char *reader, const char *from,
                                  const char *protocol );
+int  descrambler_pass          ( struct service *t, struct elementary_stream *st,
+                                 const uint8_t *tsb, int len );
 int  descrambler_descramble    ( struct service *t,
                                  struct elementary_stream *st,
                                  const uint8_t *tsb, int len );

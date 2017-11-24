@@ -24,6 +24,7 @@
 #include "url.h"
 #include "tvhpoll.h"
 #include "access.h"
+#include "atomic.h"
 
 struct channel;
 struct http_path;
@@ -130,12 +131,12 @@ typedef enum http_wsop {
 } http_wsop_t;
 
 typedef struct http_connection {
-  pthread_mutex_t hc_fd_lock;
   int hc_fd;
   struct sockaddr_storage *hc_peer;
   char *hc_peer_ipstr;
   struct sockaddr_storage *hc_self;
   char *hc_representative;
+  struct sockaddr_storage *hc_local_ip;
 
   pthread_mutex_t  *hc_paths_mutex;
   http_path_list_t *hc_paths;
@@ -143,9 +144,13 @@ typedef struct http_connection {
 
   char *hc_url;
   char *hc_url_orig;
-  int hc_keep_alive;
 
   htsbuf_queue_t  hc_reply;
+
+  int             hc_extra_insend;
+  pthread_mutex_t hc_extra_lock;
+  int             hc_extra_chunks;
+  htsbuf_queue_t  hc_extra;
 
   http_arg_list_t hc_args;
 
@@ -161,12 +166,15 @@ typedef struct http_connection {
   char *hc_nonce;
   access_t *hc_access;
 
-  struct config_head *hc_user_config;
-
-  int hc_no_output;
-  int hc_shutdown;
+  /* RTSP */
   uint64_t hc_cseq;
   char *hc_session;
+
+  /* Flags */
+  uint8_t hc_keep_alive;
+  uint8_t hc_no_output;
+  uint8_t hc_shutdown;
+  uint8_t hc_is_local_ip;   /*< a connection from the local network */
 
   /* Support for HTTP POST */
   
@@ -216,6 +224,32 @@ void http_redirect(http_connection_t *hc, const char *location,
 
 void http_css_import(http_connection_t *hc, const char *location);
 
+void http_extra_destroy(http_connection_t *hc);
+
+int http_extra_flush(http_connection_t *hc);
+
+int http_extra_flush_partial(http_connection_t *hc);
+
+int http_extra_send(http_connection_t *hc, const void *data,
+                    size_t data_len, int may_discard);
+
+int http_extra_send_prealloc(http_connection_t *hc, const void *data,
+                             size_t data_len, int may_discard);
+
+static inline void http_send_begin(http_connection_t *hc)
+{
+  atomic_add(&hc->hc_extra_insend, 1);
+  if (atomic_get(&hc->hc_extra_chunks) > 0)
+    http_extra_flush_partial(hc);
+}
+
+static inline void http_send_end(http_connection_t *hc)
+{
+  atomic_dec(&hc->hc_extra_insend, 1);
+  if (atomic_get(&hc->hc_extra_chunks) > 0)
+    http_extra_flush(hc);
+}
+
 void http_send_header(http_connection_t *hc, int rc, const char *content, 
 		      int64_t contentlen, const char *encoding,
 		      const char *location, int maxage, const char *range,
@@ -232,6 +266,8 @@ int http_websocket_read(http_connection_t *hc, htsmsg_t **_res, int timeout);
 void http_serve_requests(http_connection_t *hc);
 
 void http_cancel(void *opaque);
+
+int http_check_local_ip(http_connection_t *hc);
 
 typedef int (http_callback_t)(http_connection_t *hc, 
 			      const char *remain, void *opaque);

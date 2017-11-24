@@ -404,8 +404,9 @@ enum mpegts_mux_epg_flag
   MM_EPG_ONLY_OPENTV_SKY_AUSAT,
   MM_EPG_ONLY_BULSATCOM_39E,
   MM_EPG_ONLY_PSIP,
+  MM_EPG_ONLY_UK_CABLE_VIRGIN
 };
-#define MM_EPG_LAST MM_EPG_ONLY_PSIP
+#define MM_EPG_LAST MM_EPG_ONLY_UK_CABLE_VIRGIN
 
 enum mpegts_mux_ac3_flag
 {
@@ -610,8 +611,8 @@ struct mpegts_service
    */
 
   /**
-   * When a subscription request SMT_MPEGTS, chunk them togeather 
-   * in order to recude load.
+   * When a subscription request SMT_MPEGTS, chunk them together
+   * in order to reduce load.
    */
   sbuf_t s_tsbuf;
   int64_t s_tsbuf_last;
@@ -625,6 +626,7 @@ struct mpegts_service
    * PMT/CAT monitoring
    */
 
+  uint8_t s_cat_opened;
   mpegts_table_t *s_pmt_mon; ///< Table entry for monitoring PMT
   mpegts_table_t *s_cat_mon; ///< Table entry for monitoring CAT
 
@@ -917,7 +919,7 @@ static inline int mpegts_mux_release ( mpegts_mux_t *mm )
   return 0;
 }
 
-void mpegts_mux_save ( mpegts_mux_t *mm, htsmsg_t *c );
+void mpegts_mux_save ( mpegts_mux_t *mm, htsmsg_t *c, int refs );
 
 void mpegts_mux_tuning_error( const char *mux_uuid, mpegts_mux_instance_t *mmi_match );
 
@@ -996,13 +998,21 @@ void mpegts_input_save ( mpegts_input_t *mi, htsmsg_t *c );
 void mpegts_input_flush_mux ( mpegts_input_t *mi, mpegts_mux_t *mm );
 
 mpegts_pid_t * mpegts_input_open_pid
-  ( mpegts_input_t *mi, mpegts_mux_t *mm, int pid, int type, int weight, void *owner, int reopen );
+  ( mpegts_input_t *mi, mpegts_mux_t *mm, int pid, int type, int weight,
+    void *owner, int reopen );
 
 int mpegts_input_close_pid
-  ( mpegts_input_t *mi, mpegts_mux_t *mm, int pid, int type, int weight, void *owner );
+  ( mpegts_input_t *mi, mpegts_mux_t *mm, int pid, int type, int weight,
+    void *owner );
 
 void mpegts_input_close_pids
   ( mpegts_input_t *mi, mpegts_mux_t *mm, void *owner, int all );
+
+elementary_stream_t *mpegts_input_open_service_pid
+  ( mpegts_input_t *mi, mpegts_mux_t *mm, service_t *s,
+    streaming_component_type_t stype, int pid, int weight, int create );
+
+void mpegts_input_open_cat_monitor ( mpegts_mux_t *mm, mpegts_service_t *s );
 
 #if ENABLE_TSDEBUG
 

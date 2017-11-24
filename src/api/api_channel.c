@@ -24,6 +24,7 @@
 #include "channels.h"
 #include "access.h"
 #include "api.h"
+#include "string_list.h"
 
 static int
 api_channel_is_all(access_t *perm, htsmsg_t *args)
@@ -95,6 +96,23 @@ api_channel_create
 }
 
 static int
+api_channel_rename
+  ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
+{
+  const char *from, *to;
+  if (!(from = htsmsg_get_str(args, "from")))
+    return -EINVAL;
+  if (!(to = htsmsg_get_str(args, "to")))
+    return -EINVAL;
+  /* We need the lock since we are altering details */
+  pthread_mutex_lock(&global_lock);
+  const int num_match = channel_rename_and_save(from, to);
+  pthread_mutex_unlock(&global_lock);
+
+  return num_match > 0 ? 0 : -ENOENT;
+}
+
+static int
 api_channel_tag_list
   ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
 {
@@ -152,6 +170,51 @@ api_channel_tag_create
   return 0;
 }
 
+static int
+api_channel_cat_list
+  ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
+{
+  channel_t *ch;
+  int cfg = api_channel_is_all(perm, args);
+
+  htsmsg_t *l = htsmsg_create_list();
+  string_list_t *sl = string_list_create();
+  const string_list_item_t *item;
+
+  pthread_mutex_lock(&global_lock);
+  /* Build string_list of all categories the user is allowed
+   * to see.
+   */
+  CHANNEL_FOREACH(ch) {
+    if (!cfg && !channel_access(ch, perm, 0)) continue;
+    if (!ch->ch_enabled) continue;
+    epg_broadcast_t *e;
+    RB_FOREACH(e, &ch->ch_epg_schedule, sched_link) {
+      if (e->category) {
+        RB_FOREACH(item, e->category, h_link) {
+          const char *id = item->id;
+          /* Get rid of duplicates */
+          string_list_insert(sl, id);
+        }
+      }
+    }
+  }
+  pthread_mutex_unlock(&global_lock);
+
+  /* Now we have the unique list, convert it for GUI. */
+  RB_FOREACH(item, sl, h_link) {
+    const char *id = item->id;
+    htsmsg_add_msg(l, NULL, htsmsg_create_key_val(id, id));
+  }
+
+  *resp = htsmsg_create_map();
+  htsmsg_add_msg(*resp, "entries", l);
+
+  string_list_destroy(sl);
+  return 0;
+}
+
+
 void api_channel_init ( void )
 {
   static api_hook_t ah[] = {
@@ -159,12 +222,14 @@ void api_channel_init ( void )
     { "channel/grid",    ACCESS_ANONYMOUS, api_idnode_grid,  api_channel_grid },
     { "channel/list",    ACCESS_ANONYMOUS, api_channel_list, NULL },
     { "channel/create",  ACCESS_ADMIN,     api_channel_create, NULL },
+    { "channel/rename",  ACCESS_ADMIN,     api_channel_rename, NULL }, /* User convenience function */
 
     { "channeltag/class",ACCESS_ANONYMOUS, api_idnode_class, (void*)&channel_tag_class },
     { "channeltag/grid", ACCESS_ANONYMOUS, api_idnode_grid,  api_channel_tag_grid },
     { "channeltag/list", ACCESS_ANONYMOUS, api_channel_tag_list, NULL },
     { "channeltag/create",  ACCESS_ADMIN,  api_channel_tag_create, NULL },
 
+    { "channelcategory/list",  ACCESS_ANONYMOUS, api_channel_cat_list, NULL },
     { NULL },
   };
 

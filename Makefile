@@ -38,9 +38,9 @@ else
 CFLAGS  += -O2
 endif
 ifeq ($(CONFIG_PIE),yes)
-CFLAGS  += -fPIE -march=bonnell -mmmx -mno-3dnow -msse -msse2 -msse3 -mssse3 -mno-sse4a -mcx16 -msahf -mmovbe -mno-aes -mno-sha -mno-pclmul -mno-popcnt -mno-abm -mno-lwp -mno-fma -mno-fma4 -mno-xop -mno-bmi -mno-bmi2 -mno-tbm -mno-avx -mno-avx2 -mno-sse4.2 -mno-sse4.1 -mno-lzcnt -mno-rtm -mno-hle -mno-rdrnd -mno-f16c -mno-fsgsbase -mno-rdseed -mno-prfchw -mno-adx -mfxsr -mno-xsave -mno-xsaveopt -mno-avx512f -mno-avx512er -mno-avx512cd -mno-avx512pf -mno-prefetchwt1 -mno-clflushopt -mno-xsavec -mno-xsaves -mno-avx512dq -mno-avx512bw -mno-avx512vl -mno-avx512ifma -mno-avx512vbmi -mno-clwb -mno-pcommit -mno-mwaitx -mno-clzero -mno-pku --param l1-cache-size=24 --param l1-cache-line-size=64 --param l2-cache-size=512 -mtune=bonnell
+CFLAGS  += -fPIE -march=ivybridge -mmmx -mno-3dnow -msse -msse2 -msse3 -mssse3 -mno-sse4a -mcx16 -msahf -mno-movbe -mno-aes -mno-sha -mpclmul -mpopcnt -mno-abm -mno-lwp -mno-fma -mno-fma4 -mno-xop -mno-bmi -mno-bmi2 -mno-tbm -mno-avx -mno-avx2 -msse4.2 -msse4.1 -mno-lzcnt -mno-rtm -mno-hle -mno-rdrnd -mno-f16c -mfsgsbase -mno-rdseed -mno-prfchw -mno-adx -mfxsr -mno-xsave -mno-xsaveopt -mno-avx512f -mno-avx512er -mno-avx512cd -mno-avx512pf -mno-prefetchwt1 -mno-clflushopt -mno-xsavec -mno-xsaves -mno-avx512dq -mno-avx512bw -mno-avx512vl -mno-avx512ifma -mno-avx512vbmi -mno-clwb -mno-mwaitx -mno-clzero -mno-pku --param l1-cache-size=32 --param l1-cache-line-size=64 --param l2-cache-size=2048 -mtune=ivybridge
 else
-CFLAGS  += -fPIC -march=bonnell -mmmx -mno-3dnow -msse -msse2 -msse3 -mssse3 -mno-sse4a -mcx16 -msahf -mmovbe -mno-aes -mno-sha -mno-pclmul -mno-popcnt -mno-abm -mno-lwp -mno-fma -mno-fma4 -mno-xop -mno-bmi -mno-bmi2 -mno-tbm -mno-avx -mno-avx2 -mno-sse4.2 -mno-sse4.1 -mno-lzcnt -mno-rtm -mno-hle -mno-rdrnd -mno-f16c -mno-fsgsbase -mno-rdseed -mno-prfchw -mno-adx -mfxsr -mno-xsave -mno-xsaveopt -mno-avx512f -mno-avx512er -mno-avx512cd -mno-avx512pf -mno-prefetchwt1 -mno-clflushopt -mno-xsavec -mno-xsaves -mno-avx512dq -mno-avx512bw -mno-avx512vl -mno-avx512ifma -mno-avx512vbmi -mno-clwb -mno-pcommit -mno-mwaitx -mno-clzero -mno-pku --param l1-cache-size=24 --param l1-cache-line-size=64 --param l2-cache-size=512 -mtune=bonnell
+CFLAGS  += -fPIC -march=ivybridge -mmmx -mno-3dnow -msse -msse2 -msse3 -mssse3 -mno-sse4a -mcx16 -msahf -mno-movbe -mno-aes -mno-sha -mpclmul -mpopcnt -mno-abm -mno-lwp -mno-fma -mno-fma4 -mno-xop -mno-bmi -mno-bmi2 -mno-tbm -mno-avx -mno-avx2 -msse4.2 -msse4.1 -mno-lzcnt -mno-rtm -mno-hle -mno-rdrnd -mno-f16c -mfsgsbase -mno-rdseed -mno-prfchw -mno-adx -mfxsr -mno-xsave -mno-xsaveopt -mno-avx512f -mno-avx512er -mno-avx512cd -mno-avx512pf -mno-prefetchwt1 -mno-clflushopt -mno-xsavec -mno-xsaves -mno-avx512dq -mno-avx512bw -mno-avx512vl -mno-avx512ifma -mno-avx512vbmi -mno-clwb -mno-mwaitx -mno-clzero -mno-pku --param l1-cache-size=32 --param l1-cache-line-size=64 --param l2-cache-size=2048 -mtune=ivybridge
 endif
 ifeq ($(CONFIG_W_UNUSED_RESULT),yes)
 CFLAGS  += -Wunused-result
@@ -101,9 +101,12 @@ endif
 
 FFMPEG_PREFIX := $(BUILDDIR)/ffmpeg/build/ffmpeg
 FFMPEG_LIBDIR := $(FFMPEG_PREFIX)/lib
+FFMPEG_INCDIR := $(FFMPEG_PREFIX)/include
 FFMPEG_CONFIG := \
     PKG_CONFIG_LIBDIR=$(FFMPEG_LIBDIR)/pkgconfig $(PKG_CONFIG) \
-    --define-variable=prefix=$(FFMPEG_PREFIX) --static
+    --define-variable=prefix=$(FFMPEG_PREFIX) \
+    --define-variable=includedir=$(FFMPEG_INCDIR) \
+    --define-variable=libdir=$(FFMPEG_LIBDIR) --static
 
 ifeq ($(CONFIG_LIBX264_STATIC),yes)
 FFMPEG_DEPS += libx264
@@ -133,8 +136,8 @@ ifeq ($(CONFIG_LIBFDKAAC_STATIC),yes)
 FFMPEG_DEPS += libfdk-aac
 endif
 
-ifeq ($(CONFIG_LIBMFX_STATIC),yes)
-FFMPEG_DEPS += libmfx
+ifeq ($(CONFIG_LIBOPUS_STATIC),yes)
+FFMPEG_DEPS += libopus
 endif
 
 LDFLAGS += $(foreach lib,$(FFMPEG_LIBS),$(FFMPEG_LIBDIR)/$(lib).a)
@@ -203,8 +206,10 @@ SRCS-1 = \
 	src/tvhlog.c \
 	src/idnode.c \
 	src/prop.c \
+	src/proplib.c \
 	src/utils.c \
 	src/wrappers.c \
+	src/tvhvfs.c \
 	src/access.c \
 	src/tcp.c \
 	src/udp.c \
@@ -253,6 +258,7 @@ SRCS-1 = \
 	src/profile.c \
 	src/bouquet.c \
 	src/lock.c \
+	src/string_list.c \
 	src/wizard.c \
 	src/memoryinfo.c
 SRCS = $(SRCS-1)
@@ -280,6 +286,7 @@ SRCS-2 = \
 	src/api/api_config.c \
 	src/api/api_status.c \
 	src/api/api_idnode.c \
+	src/api/api_raw.c \
 	src/api/api_input.c \
 	src/api/api_channel.c \
 	src/api/api_service.c \
@@ -388,6 +395,7 @@ I18N-C += $(SRCS-MPEGTS-DVB)
 SRCS-MPEGTS-EPG = \
 	src/epggrab/otamux.c\
 	src/epggrab/module/eit.c \
+	src/epggrab/module/eitpatternlist.c \
 	src/epggrab/module/psip.c \
 	src/epggrab/support/freesat_huffman.c \
 	src/epggrab/module/opentv.c
@@ -473,6 +481,46 @@ SRCS-BONJOUR = \
 SRCS-$(CONFIG_BONJOUR) = $(SRCS-BONJOUR)
 I18N-C += $(SRCS-BONJOUR)
 
+# codecs
+SRCS-CODECS = $(wildcard src/transcoding/codec/*.c)
+SRCS-CODECS += $(wildcard src/transcoding/codec/codecs/*.c)
+ifneq (,$(filter yes,$(CONFIG_LIBX264) $(CONFIG_LIBX265)))
+LIBS-CODECS += libx26x
+endif
+ifeq ($(CONFIG_LIBVPX),yes)
+LIBS-CODECS += libvpx
+endif
+ifeq ($(CONFIG_LIBTHEORA),yes)
+LIBS-CODECS += libtheora
+endif
+ifeq ($(CONFIG_LIBVORBIS),yes)
+LIBS-CODECS += libvorbis
+endif
+ifeq ($(CONFIG_LIBFDKAAC),yes)
+LIBS-CODECS += libfdk_aac
+endif
+ifeq ($(CONFIG_LIBOPUS),yes)
+LIBS-CODECS += libopus
+endif
+ifeq ($(CONFIG_VAAPI),yes)
+LIBS-CODECS += vaapi
+endif
+ifeq ($(CONFIG_NVENC),yes)
+LIBS-CODECS += nvenc
+endif
+ifeq ($(CONFIG_OMX),yes)
+LIBS-CODECS += omx
+endif
+SRCS-CODECS += $(foreach lib,$(LIBS-CODECS),src/transcoding/codec/codecs/libs/$(lib).c)
+
+#hwaccels
+ifeq ($(CONFIG_HWACCELS),yes)
+SRCS-HWACCELS += src/transcoding/transcode/hwaccels/hwaccels.c
+ifeq ($(CONFIG_VAAPI),yes)
+SRCS-HWACCELS += src/transcoding/transcode/hwaccels/vaapi.c
+endif
+endif
+
 # libav
 DEPS-LIBAV = \
 	src/main.c \
@@ -480,7 +528,14 @@ DEPS-LIBAV = \
 SRCS-LIBAV = \
 	src/libav.c \
 	src/muxer/muxer_libav.c \
-	src/plumbing/transcoding.c
+	src/api/api_codec.c
+ifeq ($(CONFIG_IPTV),yes)
+SRCS-LIBAV += src/input/mpegts/iptv/iptv_libav.c
+endif
+SRCS-LIBAV += $(wildcard src/transcoding/*.c)
+SRCS-LIBAV += $(wildcard src/transcoding/transcode/*.c)
+SRCS-LIBAV += $(SRCS-HWACCELS)
+SRCS-LIBAV += $(SRCS-CODECS)
 SRCS-$(CONFIG_LIBAV) += $(SRCS-LIBAV)
 I18N-C += $(SRCS-LIBAV)
 
@@ -521,6 +576,11 @@ SRCS-DVBCAM = \
 	src/descrambler/dvbcam.c
 SRCS-${CONFIG_LINUXDVB_CA} += $(SRCS-DVBCAM)
 I18N-C += $(SRCS-DVBCAM)
+
+SRCS-DDCI = \
+	src/input/mpegts/linuxdvb/linuxdvb_ddci.c
+SRCS-${CONFIG_DDCI} += $(SRCS-DDCI)
+I18N-C += $(SRCS-DDCI)
 
 # TSDEBUGCW
 SRCS-TSDEBUG = \
@@ -793,6 +853,13 @@ ifeq ($(CONFIG_BINTRAY_CACHE),yes)
 	$(MAKE) -f Makefile.hdhomerun libcacheget
 endif
 	$(MAKE) -f Makefile.hdhomerun
+
+.PHONY: ffmpeg_rebuild
+ffmpeg_rebuild:
+	-rm ${BUILDDIR}/ffmpeg/build/ffmpeg/lib/libavcodec.a
+	-rm ${BUILDDIR}/libffmpeg_stamp
+	-rm ${BUILDDIR}/ffmpeg/ffmpeg-*/.tvh_build
+	$(MAKE) all
 
 # linuxdvb git tree
 $(ROOTDIR)/data/dvb-scan/.stamp:

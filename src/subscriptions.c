@@ -41,6 +41,7 @@
 #include "notify.h"
 #include "atomic.h"
 #include "input.h"
+#include "intlconv.h"
 #include "dbus.h"
 
 struct th_subscription_list subscriptions;
@@ -107,10 +108,8 @@ subscription_link_service(th_subscription_t *s, service_t *t)
   // Link to service output
   streaming_target_connect(&t->s_streaming_pad, &s->ths_input);
 
-  streaming_pad_deliver(&t->s_streaming_pad,
-                        streaming_msg_create_code(SMT_GRACE,
-                                                  s->ths_postpone +
-                                                    t->s_grace_delay));
+  sm = streaming_msg_create_code(SMT_GRACE, s->ths_postpone + t->s_grace_delay);
+  streaming_service_deliver(t, sm);
 
   if(s->ths_start_message != NULL && t->s_streaming_status & TSS_PACKETS) {
 
@@ -614,7 +613,7 @@ subscription_input(void *opaque, streaming_message_t *sm)
   }
 
   if (sm->sm_type == SMT_SERVICE_STATUS &&
-      (sm->sm_code & (TSS_TUNING|TSS_TIMEOUT|TSS_CA_CHECK))) {
+      (sm->sm_code & (TSS_TUNING|TSS_TIMEOUT|TSS_NO_DESCRAMBLER|TSS_CA_CHECK))) {
     error = tss2errcode(sm->sm_code);
     if (error != SM_CODE_OK)
       if (error != SM_CODE_NO_ACCESS ||
@@ -960,6 +959,39 @@ subscription_create_from_mux(profile_chain_t *prch,
      error, (service_t *)s);
 }
 #endif
+
+/**
+ *
+ */
+th_subscription_t *
+subscription_create_from_file(const char *name,
+                              const char *charset,
+                              const char *filename,
+			      const char *hostname,
+			      const char *username,
+			      const char *client)
+{
+  th_subscription_t *ts;
+  char *str, *url;
+
+  ts = subscription_create(NULL, 1, name,
+                           SUBSCRIPTION_NONE, NULL,
+                           hostname, username, client);
+  if (ts == NULL)
+    return NULL;
+  str = intlconv_to_utf8safestr(charset, filename, strlen(filename) * 3);
+  if (str == NULL)
+    str = intlconv_to_utf8safestr(intlconv_charset_id("ASCII", 1, 1),
+                                  filename, strlen(filename) * 3);
+  if (str == NULL)
+    str = strdup("error");
+  url = malloc(strlen(str) + 7 + 1);
+  strcpy(url, "file://");
+  strcat(url, str);
+  ts->ths_dvrfile = url;
+  free(str);
+  return ts;
+}
 
 /* **************************************************************************
  * Status monitoring

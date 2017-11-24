@@ -24,6 +24,7 @@
 #include "epg.h"
 #include "epggrab.h"
 #include "epggrab/private.h"
+#include "eitpatternlist.h"
 #include "input.h"
 #include "input/mpegts/dvb_charset.h"
 #include "dvr/dvr.h"
@@ -41,8 +42,21 @@ typedef struct eit_private
 
 #define EIT_CONV_HUFFMAN     1
 
-#define EIT_SPEC_UK_FREESAT  1
-#define EIT_SPEC_NZ_FREEVIEW 2
+#define EIT_SPEC_UK_FREESAT         1
+#define EIT_SPEC_NZ_FREEVIEW        2
+#define EIT_SPEC_UK_CABLE_VIRGIN    3
+
+
+/* Provider configuration */
+typedef struct eit_module_t
+{
+  epggrab_module_ota_scraper_t  ;      ///< Base struct
+  eit_pattern_list_t p_snum;
+  eit_pattern_list_t p_enum;
+  eit_pattern_list_t p_airdate;        ///< Original air date parser
+  eit_pattern_list_t p_scrape_subtitle;///< Scrape subtitle from summary data
+  eit_pattern_list_t p_is_new;         ///< Is programme new to air
+} eit_module_t;
 
 /* ************************************************************************
  * Status handling
@@ -70,6 +84,14 @@ typedef struct eit_event
   uint8_t           parental;
 
 } eit_event_t;
+
+
+/*
+ * Forward declarations
+ */
+static void _eit_module_load_config(eit_module_t *mod);
+static void _eit_scrape_clear(eit_module_t *mod);
+static void _eit_done(void *mod);
 
 /* ************************************************************************
  * Diagnostics
@@ -410,6 +432,60 @@ static int _eit_desc_crid
   return 0;
 }
 
+/* Scrape episode data from the broadcast data.
+ * @param text - string from broadcaster to search.
+ * @param eit_mod - our module with regex to use.
+ * @param en - [out] episode data
+ * @param copyright_year [out] - copyright year
+ * @param is_new [out] - is episode new
+ * @return Bitmask of changed fields.
+ */
+static uint32_t
+_eit_scrape_episode(const char *str,
+                    eit_module_t *eit_mod,
+                    epg_episode_num_t *en,
+                    uint16_t *copyright_year,
+                    uint8_t *is_new)
+{
+  if (!str) return 0;
+
+  uint32_t changed = 0;
+  /* search for season number */
+  char buffer[2048];
+  if (eit_pattern_apply_list(buffer, sizeof(buffer), str, &eit_mod->p_snum))
+    if ((en->s_num = atoi(buffer))) {
+      tvhtrace(LS_TBL_EIT,"  extract season number %d using %s", en->s_num, eit_mod->id);
+      changed |= EPG_CHANGED_EPSER_NUM;
+    }
+
+  /* ...for episode number */
+  if (eit_pattern_apply_list(buffer, sizeof(buffer), str, &eit_mod->p_enum))
+    if ((en->e_num = atoi(buffer))) {
+      tvhtrace(LS_TBL_EIT,"  extract episode number %d using %s", en->e_num, eit_mod->id);
+      changed |= EPG_CHANGED_EPNUM_NUM;
+    }
+
+  /* Extract original air date year */
+  if (eit_pattern_apply_list(buffer, sizeof(buffer), str, &eit_mod->p_airdate)) {
+    if (strlen(buffer) == 4) {
+      /* Year component only, so assume it is the copyright year. */
+      const int year = atoi(buffer);
+      if (year) {
+        *copyright_year = year;
+        changed |= EPG_CHANGED_COPYRIGHT_YEAR;
+     }
+    }
+  }
+
+  /* Extract is_new flag. Any match is assumed to mean "new" */
+  if (eit_pattern_apply_list(buffer, sizeof(buffer), str, &eit_mod->p_is_new)) {
+    *is_new = 1;
+    changed |= EPG_CHANGED_IS_NEW;
+  }
+
+  return changed;
+}
+
 
 /* ************************************************************************
  * EIT Event
@@ -421,6 +497,7 @@ static int _eit_process_event_one
     const uint8_t *ptr, int len,
     int local, int *resched, int *save )
 {
+  eit_module_t* eit_mod = (eit_module_t*)mod;
   int dllen, save2 = 0, rsonly = 0;
   time_t start, stop;
   uint16_t eid;
@@ -580,9 +657,37 @@ static int _eit_process_event_one
     ee = epg_episode_find_by_broadcast(ebc, mod, 1, save, &changes4);
   }
 
+  /* Scrape episode from within broadcast data */
+  epg_episode_num_t en;
+  memset(&en, 0, sizeof(en));
+  time_t first_aired = 0;
+  uint32_t scraped = 0;
+  uint16_t copyright_year = 0;
+  uint8_t  is_new = 0;
+
+  /* We search across all the main fields using the same regex and
+   * merge the results with the last match taking precendence.  So if
+   * EIT has episode in title and a different one in the description
+   * then we use the one from the description.
+   */
+  if (eit_mod->scrape_episode) {
+    if (ev.title)
+      scraped |=  _eit_scrape_episode(lang_str_get(ev.title, ev.default_charset),
+                                      eit_mod, &en, &copyright_year, &is_new);
+    if (ev.desc)
+      scraped |=  _eit_scrape_episode(lang_str_get(ev.desc, ev.default_charset),
+                                      eit_mod, &en, &copyright_year, &is_new);
+
+    if (ev.summary)
+      scraped |= _eit_scrape_episode(lang_str_get(ev.summary, ev.default_charset),
+                                     eit_mod, &en, &copyright_year, &is_new);
+  }
+
   /* Update Episode */
   if (ee) {
     *save |= epg_broadcast_set_episode(ebc, ee, &changes2);
+    if (scraped & EPG_CHANGED_IS_NEW)
+      *save |= epg_broadcast_set_is_new(ebc, is_new, &changes2);
     *save |= epg_episode_set_is_bw(ee, ev.bw, &changes4);
     if (ev.title)
       *save |= epg_episode_set_title(ee, ev.title, &changes4);
@@ -590,12 +695,41 @@ static int _eit_process_event_one
       *save |= epg_episode_set_genre(ee, ev.genre, &changes4);
     if (ev.parental)
       *save |= epg_episode_set_age_rating(ee, ev.parental, &changes4);
-    if (ev.summary)
+    if (ev.summary && eit_mod->scrape_subtitle) {
+      /* Freeview/Freesat have a subtitle as part of the summary in the format
+       * "subtitle: desc". So try and extract it and use that.
+       * If we can't find a subtitle then default to previous behaviour of
+       * setting the summary as the subtitle.
+       */
+      const char *summary = lang_str_get(ev.summary, ev.default_charset);
+      char buffer[2048];
+      if (eit_pattern_apply_list(buffer, sizeof(buffer), summary, &eit_mod->p_scrape_subtitle)) {
+        tvhtrace(LS_TBL_EIT, "  scrape subtitle '%s' from '%s' using %s on channel '%s'",
+                 buffer, summary, mod->id,
+                 ch ? channel_get_name(ch, channel_blank_name) : "(null)");
+        lang_str_t *ls = lang_str_create2(buffer, ev.default_charset);
+        *save |= epg_episode_set_subtitle(ee, ls, &changes4);
+        lang_str_destroy(ls);
+      } else {
+        /* No subtitle found in summary buffer. */
+        *save |= epg_episode_set_subtitle(ee, ev.summary, &changes4);
+      }
+    } else {
+      /* Scraping not enabled so set subtitle to be same as summary */
       *save |= epg_episode_set_subtitle(ee, ev.summary, &changes4);
+    }
 #if TODO_ADD_EXTRA
     if (ev.extra)
       *save |= epg_episode_set_extra(ee, extra, &changes4);
 #endif
+    /* save any found episode number */
+    if (en.s_num || en.e_num || en.p_num)
+      *save |= epg_episode_set_epnum(ee, &en, &changes4);
+    if (scraped & EPG_CHANGED_FIRST_AIRED)
+      *save |= epg_episode_set_first_aired(ee, first_aired, &changes4);
+    if (scraped & EPG_CHANGED_COPYRIGHT_YEAR)
+      *save |= epg_episode_set_copyright_year(ee, copyright_year, &changes4);
+
     *save |= epg_episode_change_finish(ee, changes4, 0);
   }
 
@@ -621,7 +755,7 @@ tidy:
       case 4:  run = EPG_RUNNING_NOW;   break;
       default: run = EPG_RUNNING_STOP;  break;
       }
-      epg_broadcast_notify_running(ebc, EPG_SOURCE_EIT, run);
+      *save |= epg_broadcast_set_running(ebc, run);
     } else if (sect == 1 && running != 2 && running != 3 && running != 4) {
     }
   }
@@ -726,6 +860,14 @@ _eit_callback
     mask <<= (24 - (sa % 32));
     st->sections[sa/32] &= ~mask;
   }
+  
+  /* UK Cable Virgin: EPG data for services in other transponders is transmitted 
+  // in the 'actual' transpoder table IDs */
+  if (spec == EIT_SPEC_UK_CABLE_VIRGIN && (tableid == 0x50 || tableid == 0x4E)) {
+    mm = mpegts_network_find_mux(mm->mm_network, onid, tsid, 1);
+  }
+  if(!mm)
+    goto done;
 
   /* Get transport stream */
   // Note: tableid=0x4f,0x60-0x6f is other TS
@@ -864,6 +1006,30 @@ static int _eit_start
   return 0;
 }
 
+static int _eit_activate(void *m, int e)
+{
+  eit_module_t *mod = m;
+  tvhtrace(LS_TBL_EIT, "_eit_activate %s change to %d from %d with scrape_episode of %d and scrape_subtitle of %d",
+           mod->id, e, mod->active, mod->scrape_episode, mod->scrape_subtitle);
+  const int original_status = mod->active;
+
+  /* We expect to be activated/deactivated infrequently so free up the
+   * lists read from the config files and reload when the scraper is
+   * activated. This allows user to modify the config files and get
+   * them re-read easily.
+   */
+  _eit_scrape_clear(mod);
+
+  mod->active = e;
+
+  if (e) {
+    _eit_module_load_config(mod);
+  }
+
+  /* Return save if value has changed */
+  return e != original_status;
+}
+
 static int _eit_tune
   ( epggrab_ota_map_t *map, epggrab_ota_mux_t *om, mpegts_mux_t *mm )
 {
@@ -899,6 +1065,95 @@ static int _eit_tune
   return r;
 }
 
+static void _eit_scrape_clear(eit_module_t *mod)
+{
+  eit_pattern_free_list(&mod->p_snum);
+  eit_pattern_free_list(&mod->p_enum);
+  eit_pattern_free_list(&mod->p_airdate);
+  eit_pattern_free_list(&mod->p_scrape_subtitle);
+  eit_pattern_free_list(&mod->p_is_new);
+}
+
+static int _eit_scrape_load_one ( htsmsg_t *m, eit_module_t* mod )
+{
+  if (mod->scrape_episode) {
+    eit_pattern_compile_list(&mod->p_snum, htsmsg_get_list(m, "season_num"));
+    eit_pattern_compile_list(&mod->p_enum, htsmsg_get_list(m, "episode_num"));
+    eit_pattern_compile_list(&mod->p_airdate, htsmsg_get_list(m, "airdate"));
+    eit_pattern_compile_list(&mod->p_is_new, htsmsg_get_list(m, "is_new"));
+  }
+
+  if (mod->scrape_subtitle) {
+    eit_pattern_compile_list(&mod->p_scrape_subtitle, htsmsg_get_list(m, "scrape_subtitle"));
+  }
+
+  return 1;
+}
+
+static void _eit_module_load_config(eit_module_t *mod)
+{
+  if (!mod->scrape_episode && !mod->scrape_subtitle) {
+    tvhinfo(LS_TBL_EIT, "module %s - scraper disabled by config", mod->id);
+    return;
+  }
+
+  const char config_path[] = "epggrab/eit/scrape/%s";
+  /* Only use the user config if they have supplied one and it is not empty.
+   * Otherwise we default to using configuration based on the module
+   * name such as "uk_freeview".
+   */
+  const char *config_file = mod->scrape_config && *mod->scrape_config ?
+    mod->scrape_config : mod->id;
+
+  tvhinfo(LS_TBL_EIT, "scraper %s attempt to load config \"%s\"", mod->id, config_file);
+
+  htsmsg_t *m = hts_settings_load(config_path, config_file);
+  char *generic_name = NULL;
+  if (!m) {
+    /* No config file so try loading a generic config based on
+     * the first component of the id. In the above case it would
+     * be "uk". This allows config for a country to be shared across
+     * two grabbers such as DVB-T and DVB-S.
+     */
+    generic_name = strdup(config_file);
+    if (generic_name) {
+      char *underscore = strstr(generic_name, "_");
+      if (underscore) {
+        /* Terminate the string at the underscore */
+        *underscore = 0;
+        config_file = generic_name;
+        m = hts_settings_load(config_path, config_file);
+      }
+    }
+  }
+
+  if (m) {
+    const int r = _eit_scrape_load_one(m, mod);
+    if (r > 0)
+      tvhinfo(LS_TBL_EIT, "scraper %s loaded config \"%s\"", mod->id, config_file);
+    else
+      tvhwarn(LS_TBL_EIT, "scraper %s failed to load config \"%s\"", mod->id, config_file);
+    htsmsg_destroy(m);
+  } else {
+      tvhinfo(LS_TBL_EIT, "scraper %s no scraper config files found", mod->id);
+  }
+
+  if (generic_name)
+    free(generic_name);
+}
+
+static eit_module_t *eit_module_ota_create
+  ( const char *id, int subsys, const char *saveid,
+    const char *name, int priority,
+    epggrab_ota_module_ops_t *ops )
+{
+  eit_module_t * mod = (eit_module_t *)
+    epggrab_module_ota_create(calloc(1, sizeof(eit_module_t)),
+                              id, subsys, saveid,
+                              name, priority, 1, ops);
+  return mod;
+}
+
 #define EIT_OPS(name, _pid, _conv, _spec) \
   static eit_private_t opaque_##name = { \
     .pid = (_pid), \
@@ -907,12 +1162,14 @@ static int _eit_tune
   }; \
   static epggrab_ota_module_ops_t name = { \
     .start  = _eit_start, \
+    .done = _eit_done, \
+    .activate = _eit_activate, \
     .tune   = _eit_tune, \
     .opaque = &opaque_##name, \
   }
 
 #define EIT_CREATE(id, name, prio, ops) \
-  epggrab_module_ota_create(NULL, id, LS_TBL_EIT, NULL, name, prio, ops)
+  eit_module_ota_create(id, LS_TBL_EIT, NULL, name, prio, ops)
 
 void eit_init ( void )
 {
@@ -922,6 +1179,7 @@ void eit_init ( void )
   EIT_OPS(ops_nz_freeview, 0, EIT_CONV_HUFFMAN, EIT_SPEC_NZ_FREEVIEW);
   EIT_OPS(ops_baltic, 0x39, 0, 0);
   EIT_OPS(ops_bulsat, 0x12b, 0, 0);
+  EIT_OPS(ops_uk_cable_virgin, 0x2bc, 0, EIT_SPEC_UK_CABLE_VIRGIN);
 
   EIT_CREATE("eit", "EIT: DVB Grabber", 1, &ops);
   EIT_CREATE("uk_freesat", "UK: Freesat", 5, &ops_uk_freesat);
@@ -929,6 +1187,13 @@ void eit_init ( void )
   EIT_CREATE("nz_freeview", "New Zealand: Freeview", 5, &ops_nz_freeview);
   EIT_CREATE("viasat_baltic", "VIASAT: Baltic", 5, &ops_baltic);
   EIT_CREATE("Bulsatcom_39E", "Bulsatcom: Bula 39E", 5, &ops_bulsat);
+  EIT_CREATE("uk_cable_virgin", "UK: Cable Virgin", 5, &ops_uk_cable_virgin);
+}
+
+void _eit_done ( void *m )
+{
+  eit_module_t *mod = m;
+  _eit_scrape_clear(mod);
 }
 
 void eit_done ( void )

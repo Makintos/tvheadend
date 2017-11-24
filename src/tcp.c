@@ -34,6 +34,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <ifaddrs.h>
 
 #include "tvheadend.h"
 #include "tcp.h"
@@ -74,30 +76,101 @@ socket_set_dscp(int sockfd, uint32_t dscp, char *errbuf, size_t errbufsize)
  *
  */
 int
+ip_check_is_local_address
+  (const struct sockaddr_storage *peer, const struct sockaddr_storage *local,
+   struct sockaddr_storage *used_local)
+{
+  struct ifaddrs *iflist, *ifdev = NULL;
+  struct sockaddr_storage *ifaddr, *ifnetmask;
+  int any_address, ret;
+
+  // Note: Not all platforms have getifaddrs()
+  //       See http://docs.freeswitch.org/switch__utils_8c_source.html
+  if (!local || !peer)
+    return 0;
+
+  if (peer->ss_family != local->ss_family)
+    return 0;
+
+  if (getifaddrs(&iflist) < 0)
+    return 0;
+
+  any_address = ip_check_is_any(local);
+
+  for (ifdev = iflist, ret = 0; ifdev && ret == 0; ifdev = ifdev->ifa_next) {
+    ifaddr = (struct sockaddr_storage *)(ifdev->ifa_addr);
+    ifnetmask = (struct sockaddr_storage *)(ifdev->ifa_netmask);
+    if (!ifaddr || !ifnetmask) continue;
+    if (ifaddr->ss_family != local->ss_family) continue;
+    if (!any_address && !ip_check_equal(ifaddr, local)) continue;
+    ret = !!ip_check_in_network_v4(ifaddr, ifnetmask, peer);
+    if (ret) {
+      if (used_local)
+        memcpy(used_local, ifaddr, sizeof(struct sockaddr));
+      break;
+    }
+  }
+  freeifaddrs(iflist);
+  return ret;
+}
+
+/**
+ *
+ */
+int
 tcp_connect(const char *hostname, int port, const char *bindaddr,
             char *errbuf, size_t errbufsize, int timeout)
 {
-  int fd, r, res, err;
-  struct addrinfo *ai, hints;
+  int fd = -1, r, res, err;
+  struct addrinfo *ai, *rai = NULL, hints;
+  struct sockaddr_storage bindip;
   char portstr[6];
   socklen_t errlen = sizeof(err);
+
+  errbuf[0] = '\0';
+
+  memset(&bindip, 0, sizeof(bindip));
+  bindip.ss_family = AF_UNSPEC;
+  if (bindaddr && bindaddr[0] != '\0') {
+    if (tcp_get_ip_from_str(bindaddr, &bindip) == NULL) {
+      snprintf(errbuf, errbufsize, "Cannot bind to addr '%s'", bindaddr);
+      return -1;
+    }
+  }
 
   snprintf(portstr, 6, "%u", port);
   memset(&hints, 0, sizeof(struct addrinfo));
   hints.ai_family = AF_UNSPEC;
   res = getaddrinfo(hostname, portstr, &hints, &ai);
-  
   if (res != 0) {
     snprintf(errbuf, errbufsize, "%s", gai_strerror(res));
     return -1;
   }
 
-  fd = tvh_socket(ai->ai_family, SOCK_STREAM, 0);
+again:
+  if (fd >= 0) {
+    close(fd);
+    fd = -1;
+  }
+  rai = rai == NULL ? ai : rai->ai_next;
+  if (rai == NULL) {
+    if (errbuf[0] == '\0')
+      snprintf(errbuf, errbufsize, "Invalid or unresolved hostname '%s'", hostname);
+    goto error;
+  }
+
+  if (bindip.ss_family == AF_UNSPEC) {
+    if (rai->ai_family != AF_INET && rai->ai_family != AF_INET6)
+      goto again;
+  } else if (rai->ai_family != bindip.ss_family) {
+    goto again;
+  }
+
+  fd = tvh_socket(rai->ai_family, SOCK_STREAM, 0);
   if(fd < 0) {
     snprintf(errbuf, errbufsize, "Unable to create socket: %s",
 	     strerror(errno));
-    freeaddrinfo(ai);
-    return -1;
+    goto again;
   }
 
   /**
@@ -105,30 +178,17 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
    */
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
-  if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
-    if (bindaddr && bindaddr[0] != '\0') {
-      struct sockaddr_storage ip;
-      memset(&ip, 0, sizeof(ip));
-      ip.ss_family = ai->ai_family;
-      if (inet_pton(AF_INET, bindaddr, IP_IN_ADDR(ip)) <= 0 ||
-          bind(fd, (struct sockaddr *)&ip, IP_IN_ADDRLEN(ip)) < 0) {
-        snprintf(errbuf, errbufsize, "Cannot bind to IPv%s addr '%s'",
-                                     ai->ai_family == AF_INET6 ? "6" : "4",
-                                     bindaddr);
-        freeaddrinfo(ai);
-        close(fd);
-        return -1;
-      }
+  if (bindip.ss_family != AF_UNSPEC) {
+    if (bind(fd, (struct sockaddr *)&bindip, IP_IN_ADDRLEN(bindip)) < 0) {
+      snprintf(errbuf, errbufsize, "Cannot bind to IPv%s addr '%s:%i': %s",
+                                   bindip.ss_family == AF_INET6 ? "6" : "4",
+                                   bindaddr, htons(IP_PORT(bindip)),
+                                   strerror(errno));
+      goto error;
     }
-  } else {
-    snprintf(errbuf, errbufsize, "Invalid protocol family");
-    freeaddrinfo(ai);
-    close(fd);
-    return -1;
   }
 
-  r = connect(fd, ai->ai_addr, ai->ai_addrlen);
-  freeaddrinfo(ai);
+  r = connect(fd, rai->ai_addr, rai->ai_addrlen);
 
   if(r < 0) {
     /* timeout < 0 - do not wait at all */
@@ -147,14 +207,13 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
 
       /* minimal timeout is one second */
       if (timeout < 1)
-        timeout = 0;
+        timeout = 1;
 
       while (1) {
         if (!tvheadend_is_running()) {
           errbuf[0] = '\0';
           tvhpoll_destroy(efd);
-          close(fd);
-          return -1;
+          goto error;
         }
 
         r = tvhpoll_wait(efd, &ev, 1, timeout * 1000);
@@ -162,17 +221,15 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
           break;
         
         if (r == 0) { /* Timeout */
-          snprintf(errbuf, errbufsize, "Connection attempt timed out");
+          snprintf(errbuf, errbufsize, "Connection attempt to '%s' timed out", hostname);
           tvhpoll_destroy(efd);
-          close(fd);
-          return -1;
+          goto again;
         }
       
         if (!ERRNO_AGAIN(errno)) {
           snprintf(errbuf, errbufsize, "poll() error: %s", strerror(errno));
           tvhpoll_destroy(efd);
-          close(fd);
-          return -1;
+          goto error;
         }
       }
       
@@ -187,18 +244,23 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
 
   if(err != 0) {
     snprintf(errbuf, errbufsize, "%s", strerror(err));
-    close(fd);
-    return -1;
+    goto again;
   }
   
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-
 
   /* Set the keep-alive active */
   err = 1;
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&err, errlen);
 
+  freeaddrinfo(ai);
   return fd;
+
+error:
+  if (fd >= 0)
+    close(fd);
+  freeaddrinfo(ai);
+  return -1;
 }
 
 
@@ -545,7 +607,7 @@ try_again:
     c2 = aa->aa_conn_limit_streaming ? used >= aa->aa_conn_limit_streaming : -1;
 
     if (c1 && c2) {
-      if (started + sec2mono(3) < mclk()) {
+      if (started + sec2mono(5) < mclk()) {
         tvherror(LS_TCP, "multiple connections are not allowed for user '%s' from '%s' "
                         "(limit %u, streaming limit %u, active streaming %u, DVR %u)",
                  aa->aa_username ?: "", aa->aa_representative ?: "",
@@ -556,7 +618,7 @@ try_again:
       pthread_mutex_unlock(&global_lock);
       tvh_safe_usleep(250000);
       pthread_mutex_lock(&global_lock);
-      if (tvheadend_is_running())
+      if (!tcp_socket_dead(fd) && tvheadend_is_running())
         goto try_again;
       return NULL;
     }

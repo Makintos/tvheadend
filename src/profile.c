@@ -25,7 +25,8 @@
 #include "plumbing/globalheaders.h"
 #if ENABLE_LIBAV
 #include "lang_codes.h"
-#include "plumbing/transcoding.h"
+#include "transcoding/transcode.h"
+#include "transcoding/codec.h"
 #endif
 #if ENABLE_TIMESHIFT
 #include "timeshift.h"
@@ -97,6 +98,7 @@ profile_create
   }
   LIST_INIT(&pro->pro_dvr_configs);
   LIST_INIT(&pro->pro_accesses);
+  pro->pro_swservice = 1;
   pro->pro_contaccess = 1;
   pro->pro_ca_timeout = 2000;
   if (idnode_insert(&pro->pro_id, uuid, pb->clazz, 0)) {
@@ -158,7 +160,8 @@ profile_class_save ( idnode_t *in, char *filename, size_t fsize )
   idnode_save(in, c);
   if (pro->pro_shield)
     htsmsg_add_bool(c, "shield", 1);
-  snprintf(filename, fsize, "profile/%s", idnode_uuid_as_str(in, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "profile/%s", idnode_uuid_as_str(in, ubuf));
   if (pro->pro_conf_changed)
     pro->pro_conf_changed(pro);
   return c;
@@ -184,7 +187,7 @@ profile_class_delete(idnode_t *self)
 }
 
 static uint32_t
-profile_class_enabled_opts(void *o)
+profile_class_enabled_opts(void *o, uint32_t opts)
 {
   profile_t *pro = o;
   uint32_t r = 0;
@@ -232,7 +235,7 @@ profile_class_default_set(void *o, const void *v)
 }
 
 static uint32_t
-profile_class_name_opts(void *o)
+profile_class_name_opts(void *o, uint32_t opts)
 {
   profile_t *pro = o;
   uint32_t r = 0;
@@ -538,8 +541,11 @@ profile_find_by_list
   } else {
     res = pro;
   }
-  if (!res)
+  if (!res) {
     res = profile_find_by_name((sflags & SUBSCRIPTION_HTSP) ? "htsp" : NULL, NULL);
+    if (!profile_verify(res, sflags))
+      tvherror(LS_PROFILE, "unable to select a working profile (asked '%s' alt '%s')", name, alt);
+  }
   return res;
 }
 
@@ -766,6 +772,7 @@ profile_sharer_deliver(profile_chain_t *prch, streaming_message_t *sm)
       n->pkt_pcr -= prch->prch_ts_delta;
       sm->sm_data = n;
     } else {
+      pkt_trace(LS_PROFILE, pkt, "packet drop (delta %"PRId64")", prch->prch_ts_delta);
       streaming_msg_free(sm);
       return;
     }
@@ -908,12 +915,13 @@ profile_sharer_postinit(profile_sharer_t *prsh)
     return 0;
   if (prsh->prsh_queue_run)
     return 0;
+  prsh->prsh_queue_run = 1;
   r = tvhthread_create(&prsh->prsh_queue_thread, NULL,
                        profile_sharer_thread, prsh, "sharer");
-  if (!r)
-    prsh->prsh_queue_run = 1;
-  else
+  if (r) {
+    prsh->prsh_queue_run = 0;
     tvherror(LS_PROFILE, "unable to create sharer thread");
+  }
   return r;
 }
 
@@ -1030,11 +1038,12 @@ profile_chain_work(profile_chain_t *prch, struct streaming_target *dst,
  */
 int
 profile_chain_reopen(profile_chain_t *prch,
-                     muxer_config_t *m_cfg, int flags)
+                     muxer_config_t *m_cfg,
+                     muxer_hints_t *hints, int flags)
 {
   profile_t *pro = prch->prch_pro;
   if (pro && pro->pro_reopen)
-    return pro->pro_reopen(prch, m_cfg, flags);
+    return pro->pro_reopen(prch, m_cfg, hints, flags);
   return -1;
 }
 
@@ -1043,11 +1052,13 @@ profile_chain_reopen(profile_chain_t *prch,
  */
 int
 profile_chain_open(profile_chain_t *prch,
-                   muxer_config_t *m_cfg, int flags, size_t qsize)
+                   muxer_config_t *m_cfg,
+                   muxer_hints_t *hints,
+                   int flags, size_t qsize)
 {
   profile_t *pro = prch->prch_pro;
   if (pro && pro->pro_open)
-    return pro->pro_open(prch, m_cfg, flags, qsize);
+    return pro->pro_open(prch, m_cfg, hints, flags, qsize);
   return -1;
 }
 
@@ -1068,7 +1079,7 @@ profile_chain_raw_open(profile_chain_t *prch, void *id, size_t qsize, int muxer)
   if (muxer) {
     memset(&c, 0, sizeof(c));
     c.m_type = MC_RAW;
-    prch->prch_muxer = muxer_create(&c);
+    prch->prch_muxer = muxer_create(&c, NULL);
   }
   return 0;
 }
@@ -1212,19 +1223,12 @@ fail:
   return -1;
 }
 
-static muxer_container_type_t
-profile_htsp_get_mc(profile_t *_pro)
-{
-  return MC_UNKNOWN;
-}
-
 static profile_t *
 profile_htsp_builder(void)
 {
   profile_t *pro = calloc(1, sizeof(*pro));
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_work   = profile_htsp_work;
-  pro->pro_get_mc = profile_htsp_get_mc;
   return pro;
 }
 
@@ -1382,13 +1386,14 @@ const idclass_t profile_mpegts_pass_class =
 
 static int
 profile_mpegts_pass_reopen(profile_chain_t *prch,
-                           muxer_config_t *m_cfg, int flags)
+                           muxer_config_t *m_cfg,
+                           muxer_hints_t *hints, int flags)
 {
   profile_mpegts_t *pro = (profile_mpegts_t *)prch->prch_pro;
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   if (c.m_type != MC_RAW)
@@ -1400,13 +1405,15 @@ profile_mpegts_pass_reopen(profile_chain_t *prch,
   c.u.pass.m_rewrite_eit = pro->pro_rewrite_eit;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_mpegts_pass_open(profile_chain_t *prch,
-                         muxer_config_t *m_cfg, int flags, size_t qsize)
+                         muxer_config_t *m_cfg,
+                         muxer_hints_t *hints,
+                         int flags, size_t qsize)
 {
   prch->prch_flags = SUBSCRIPTION_MPEGTS;
 
@@ -1415,14 +1422,7 @@ profile_mpegts_pass_open(profile_chain_t *prch,
 
   prch->prch_st    = &prch->prch_sq.sq_st;
 
-  profile_mpegts_pass_reopen(prch, m_cfg, flags);
-  return 0;
-}
-
-static muxer_container_type_t
-profile_mpegts_pass_get_mc(profile_t *_pro)
-{
-  return MC_PASS;
+  return profile_mpegts_pass_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1432,12 +1432,148 @@ profile_mpegts_pass_builder(void)
   pro->pro_sflags = SUBSCRIPTION_MPEGTS;
   pro->pro_reopen = profile_mpegts_pass_reopen;
   pro->pro_open   = profile_mpegts_pass_open;
-  pro->pro_get_mc = profile_mpegts_pass_get_mc;
   pro->pro_rewrite_sid = 1;
   pro->pro_rewrite_pat = 1;
   pro->pro_rewrite_pmt = 1;
   pro->pro_rewrite_sdt = 1;
   pro->pro_rewrite_eit = 1;
+  return (profile_t *)pro;
+}
+
+/*
+ *  MPEG-TS spawn muxer
+ */
+typedef struct profile_mpegts_spawn {
+  profile_t;
+  char *pro_cmdline;
+  char *pro_mime;
+  int   pro_killsig;
+  int   pro_killtimeout;
+} profile_mpegts_spawn_t;
+
+const idclass_t profile_mpegts_spawn_class =
+{
+  .ic_super      = &profile_class,
+  .ic_class      = "profile-mpegts-spawn",
+  .ic_caption    = N_("MPEG-TS Spawn/built-in"),
+  .ic_groups     = (const property_group_t[]) {
+    {
+      .name   = N_("Configuration"),
+      .number = 1,
+    },
+    {
+      .name   = N_("Spawn configuration"),
+      .number = 2,
+    },
+    {}
+  },
+  .ic_properties = (const property_t[]){
+    {
+      .type     = PT_STR,
+      .id       = "cmdline",
+      .name     = N_("Command line"),
+      .desc     = N_("Command line to run a task which accepts MPEG-TS stream"
+                     " on stdin and writes output to stdout in format specified"
+                     " by the selected mime type."),
+      .off      = offsetof(profile_mpegts_spawn_t, pro_cmdline),
+      .opts     = PO_MULTILINE,
+      .group    = 2
+    },
+    {
+      .type     = PT_STR,
+      .id       = "mime",
+      .name     = N_("Mime type"),
+      .desc     = N_("Mime type string (for example 'video/mp2t')."),
+      .off      = offsetof(profile_mpegts_spawn_t, pro_mime),
+      .group    = 2
+    },
+    {
+      .type     = PT_INT,
+      .id       = "killsig",
+      .name     = N_("Kill signal (pipe)"),
+      .off      = offsetof(profile_mpegts_spawn_t, pro_killsig),
+      .list     = proplib_kill_list,
+      .opts     = PO_EXPERT,
+      .def.i    = TVH_KILL_TERM,
+      .group    = 2
+    },
+    {
+      .type     = PT_INT,
+      .id       = "kill_timeout",
+      .name     = N_("Kill timeout (pipe/secs)"),
+      .off      = offsetof(profile_mpegts_spawn_t, pro_killtimeout),
+      .opts     = PO_EXPERT,
+      .def.i    = 15,
+      .group    = 2
+    },
+    { }
+  }
+};
+
+static int
+profile_mpegts_spawn_reopen(profile_chain_t *prch,
+                            muxer_config_t *m_cfg,
+                            muxer_hints_t *hints, int flags)
+{
+  profile_mpegts_spawn_t *pro = (profile_mpegts_spawn_t *)prch->prch_pro;
+  muxer_config_t c;
+
+  if (m_cfg)
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
+  else
+    memset(&c, 0, sizeof(c));
+  if (c.m_type != MC_RAW)
+    c.m_type = MC_PASS;
+
+  c.u.pass.m_rewrite_sid = 1;
+  c.u.pass.m_rewrite_pat = 1;
+  c.u.pass.m_rewrite_pmt = 1;
+  c.u.pass.m_rewrite_sdt = 1;
+  c.u.pass.m_rewrite_eit = 1;
+  mystrset(&c.u.pass.m_cmdline, pro->pro_cmdline);
+  mystrset(&c.u.pass.m_mime, pro->pro_mime);
+  c.u.pass.m_killsig = pro->pro_killsig;
+  c.u.pass.m_killtimeout = pro->pro_killtimeout;
+
+  assert(!prch->prch_muxer);
+  prch->prch_muxer = muxer_create(&c, hints);
+  return 0;
+}
+
+static int
+profile_mpegts_spawn_open(profile_chain_t *prch,
+                          muxer_config_t *m_cfg,
+                          muxer_hints_t *hints,
+                          int flags, size_t qsize)
+{
+  prch->prch_flags = SUBSCRIPTION_MPEGTS;
+
+  prch->prch_sq.sq_st.st_reject_filter = SMT_PACKET;
+  prch->prch_sq.sq_maxsize = qsize;
+
+  prch->prch_st    = &prch->prch_sq.sq_st;
+
+  return profile_mpegts_spawn_reopen(prch, m_cfg, hints, flags);
+}
+
+static void
+profile_mpegts_spawn_free(profile_t *_pro)
+{
+  profile_mpegts_spawn_t *pro = (profile_mpegts_spawn_t *)_pro;
+  free(pro->pro_cmdline);
+  free(pro->pro_mime);
+}
+
+static profile_t *
+profile_mpegts_spawn_builder(void)
+{
+  profile_mpegts_spawn_t *pro = calloc(1, sizeof(*pro));
+  pro->pro_sflags = SUBSCRIPTION_MPEGTS;
+  pro->pro_free   = profile_mpegts_spawn_free;
+  pro->pro_reopen = profile_mpegts_spawn_reopen;
+  pro->pro_open   = profile_mpegts_spawn_open;
+  pro->pro_killsig = TVH_KILL_TERM;
+  pro->pro_killtimeout = 15;
   return (profile_t *)pro;
 }
 
@@ -1493,13 +1629,14 @@ const idclass_t profile_matroska_class =
 
 static int
 profile_matroska_reopen(profile_chain_t *prch,
-                        muxer_config_t *m_cfg, int flags)
+                        muxer_config_t *m_cfg,
+                        muxer_hints_t *hints, int flags)
 {
   profile_matroska_t *pro = (profile_matroska_t *)prch->prch_pro;
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   if (c.m_type != MC_WEBM)
@@ -1510,13 +1647,15 @@ profile_matroska_reopen(profile_chain_t *prch,
   c.u.mkv.m_dvbsub_reorder = pro->pro_dvbsub_reorder;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_matroska_open(profile_chain_t *prch,
-                      muxer_config_t *m_cfg, int flags, size_t qsize)
+                      muxer_config_t *m_cfg,
+                      muxer_hints_t *hints,
+                      int flags, size_t qsize)
 {
   streaming_target_t *dst;
 
@@ -1527,18 +1666,7 @@ profile_matroska_open(profile_chain_t *prch,
   dst = prch->prch_tsfix = tsfix_create(dst);
   prch->prch_st    = dst;
 
-  profile_matroska_reopen(prch, m_cfg, flags);
-
-  return 0;
-}
-
-static muxer_container_type_t
-profile_matroska_get_mc(profile_t *_pro)
-{
-  profile_matroska_t *pro = (profile_matroska_t *)_pro;
-  if (pro->pro_webm)
-    return MC_WEBM;
-  return MC_MATROSKA;
+  return profile_matroska_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1548,7 +1676,6 @@ profile_matroska_builder(void)
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_reopen = profile_matroska_reopen;
   pro->pro_open   = profile_matroska_open;
-  pro->pro_get_mc = profile_matroska_get_mc;
   pro->pro_dvbsub_reorder = 1;
   return (profile_t *)pro;
 }
@@ -1607,13 +1734,14 @@ const idclass_t profile_audio_class =
 
 static int
 profile_audio_reopen(profile_chain_t *prch,
-                     muxer_config_t *m_cfg, int flags)
+                     muxer_config_t *m_cfg,
+                     muxer_hints_t *hints, int flags)
 {
   muxer_config_t c;
   profile_audio_t *pro = (profile_audio_t *)prch->prch_pro;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   c.m_type = pro->pro_mc != MC_UNKNOWN ? pro->pro_mc : MC_MPEG2AUDIO;
@@ -1621,13 +1749,15 @@ profile_audio_reopen(profile_chain_t *prch,
   c.u.audioes.m_index = pro->pro_index;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_audio_open(profile_chain_t *prch,
-                   muxer_config_t *m_cfg, int flags, size_t qsize)
+                   muxer_config_t *m_cfg,
+                   muxer_hints_t *hints,
+                   int flags, size_t qsize)
 {
   int r;
 
@@ -1640,17 +1770,7 @@ profile_audio_open(profile_chain_t *prch,
     return r;
   }
 
-  profile_audio_reopen(prch, m_cfg, flags);
-  return 0;
-}
-
-static muxer_container_type_t
-profile_audio_get_mc(profile_t *_pro)
-{
-  profile_audio_t *pro = (profile_audio_t *)_pro;
-  if (pro->pro_mc == MC_UNKNOWN)
-    return MC_MPEG2AUDIO;
-  return pro->pro_mc;
+  return profile_audio_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1660,7 +1780,6 @@ profile_audio_builder(void)
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_reopen = profile_audio_reopen;
   pro->pro_open   = profile_audio_open;
-  pro->pro_get_mc = profile_audio_get_mc;
   return (profile_t *)pro;
 }
 
@@ -1686,24 +1805,27 @@ const idclass_t profile_libav_mpegts_class =
 
 static int
 profile_libav_mpegts_reopen(profile_chain_t *prch,
-                            muxer_config_t *m_cfg, int flags)
+                            muxer_config_t *m_cfg,
+                            muxer_hints_t *hints, int flags)
 {
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   c.m_type = MC_MPEGTS;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_libav_mpegts_open(profile_chain_t *prch,
-                          muxer_config_t *m_cfg, int flags, size_t qsize)
+                          muxer_config_t *m_cfg,
+                          muxer_hints_t *hints,
+                          int flags, size_t qsize)
 {
   int r;
 
@@ -1716,14 +1838,7 @@ profile_libav_mpegts_open(profile_chain_t *prch,
     return r;
   }
 
-  profile_libav_mpegts_reopen(prch, m_cfg, flags);
-  return 0;
-}
-
-static muxer_container_type_t
-profile_libav_mpegts_get_mc(profile_t *_pro)
-{
-  return MC_MPEGTS;
+  return profile_libav_mpegts_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1733,7 +1848,6 @@ profile_libav_mpegts_builder(void)
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_reopen = profile_libav_mpegts_reopen;
   pro->pro_open   = profile_libav_mpegts_open;
-  pro->pro_get_mc = profile_libav_mpegts_get_mc;
   return (profile_t *)pro;
 }
 
@@ -1778,13 +1892,14 @@ const idclass_t profile_libav_matroska_class =
 
 static int
 profile_libav_matroska_reopen(profile_chain_t *prch,
-                              muxer_config_t *m_cfg, int flags)
+                              muxer_config_t *m_cfg,
+                              muxer_hints_t *hints, int flags)
 {
   profile_libav_matroska_t *pro = (profile_libav_matroska_t *)prch->prch_pro;
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   if (c.m_type != MC_AVWEBM)
@@ -1793,13 +1908,15 @@ profile_libav_matroska_reopen(profile_chain_t *prch,
     c.m_type = MC_AVWEBM;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_libav_matroska_open(profile_chain_t *prch,
-                            muxer_config_t *m_cfg, int flags, size_t qsize)
+                            muxer_config_t *m_cfg,
+                            muxer_hints_t *hints,
+                            int flags, size_t qsize)
 {
   int r;
 
@@ -1812,18 +1929,7 @@ profile_libav_matroska_open(profile_chain_t *prch,
     return r;
   }
 
-  profile_libav_matroska_reopen(prch, m_cfg, flags);
-
-  return 0;
-}
-
-static muxer_container_type_t
-profile_libav_matroska_get_mc(profile_t *_pro)
-{
-  profile_libav_matroska_t *pro = (profile_libav_matroska_t *)_pro;
-  if (pro->pro_webm)
-    return MC_AVWEBM;
-  return MC_AVMATROSKA;
+  return profile_libav_matroska_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1833,7 +1939,6 @@ profile_libav_matroska_builder(void)
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_reopen = profile_libav_matroska_reopen;
   pro->pro_open   = profile_libav_matroska_open;
-  pro->pro_get_mc = profile_libav_matroska_get_mc;
   return (profile_t *)pro;
 }
 
@@ -1853,25 +1958,28 @@ const idclass_t profile_libav_mp4_class =
 
 static int
 profile_libav_mp4_reopen(profile_chain_t *prch,
-                         muxer_config_t *m_cfg, int flags)
+                         muxer_config_t *m_cfg,
+                         muxer_hints_t *hints, int flags)
 {
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   if (c.m_type != MC_AVMP4)
     c.m_type = MC_AVMP4;
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_libav_mp4_open(profile_chain_t *prch,
-                       muxer_config_t *m_cfg, int flags, size_t qsize)
+                       muxer_config_t *m_cfg,
+                       muxer_hints_t *hints,
+                       int flags, size_t qsize)
 {
   int r;
 
@@ -1884,15 +1992,7 @@ profile_libav_mp4_open(profile_chain_t *prch,
     return r;
   }
 
-  profile_libav_mp4_reopen(prch, m_cfg, flags);
-
-  return 0;
-}
-
-static muxer_container_type_t
-profile_libav_mp4_get_mc(profile_t *_pro)
-{
-  return MC_AVMP4;
+  return profile_libav_mp4_reopen(prch, m_cfg, hints, flags);
 }
 
 static profile_t *
@@ -1902,7 +2002,6 @@ profile_libav_mp4_builder(void)
   pro->pro_sflags = SUBSCRIPTION_PACKET;
   pro->pro_reopen = profile_libav_mp4_reopen;
   pro->pro_open   = profile_libav_mp4_open;
-  pro->pro_get_mc = profile_libav_mp4_get_mc;
   return (profile_t *)pro;
 }
 
@@ -1910,37 +2009,17 @@ profile_libav_mp4_builder(void)
  *  Transcoding + packet-like muxers
  */
 
-static int profile_transcode_experimental_codecs = 1;
-
 typedef struct profile_transcode {
   profile_t;
-  int      pro_mc;
-  uint32_t pro_resolution;
-  uint32_t pro_channels;
-  uint32_t pro_vbitrate;
-  uint32_t pro_abitrate;
-  char    *pro_language;
-  char    *pro_vcodec;
-  char    *pro_vcodec_preset;
-  char    *pro_acodec;
-  char    *pro_scodec;
-  char    *pro_src_vcodec;
+  int   pro_mc;
+  char *pro_vcodec;
+  char *pro_src_vcodec;
+  char *pro_acodec;
+  char *pro_src_acodec;
+  char *pro_scodec;
+  char *pro_src_scodec;
 } profile_transcode_t;
 
-
-static htsmsg_t *
-profile_class_src_vcodec_list ( void *o, const char *lang )
-{
-  static const struct strtab_str tab[] = {
-    { N_("Any"),		"" },
-    { "MPEG2VIDEO",      	"MPEG2VIDEO" },
-    { "H264",      		"H264" },
-    { "VP8",      		"VP8" },
-    { "HEVC",      		"HEVC" },
-    { "VP9",      		"VP9" },
-  };
-  return strtab2htsmsg_str(tab, 1, lang);
-}
 
 static htsmsg_t *
 profile_class_mc_list ( void *o, const char *lang )
@@ -1959,151 +2038,179 @@ profile_class_mc_list ( void *o, const char *lang )
   return strtab2htsmsg(tab, 1, lang);
 }
 
-static htsmsg_t *
-profile_class_channels_list ( void *o, const char *lang )
+static int
+htsmsg_add_entry(htsmsg_t *list, const char *key, const char *val)
 {
-  static const struct strtab tab[] = {
-    { N_("Copy layout"),                   0 },
-    { N_("Mono"),                          1 },
-    { N_("Stereo"),                        2 },
-    { N_("Surround (2 front, rear mono)"), 3 },
-    { N_("Quad (4.0)"),                    4 },
-    { N_("5.0"),                           5 },
-    { N_("5.1"),                           6 },
-    { N_("6.1"),                           7 },
-    { N_("7.1"),                           8 }
-  };
-  return strtab2htsmsg(tab, 1, lang);
+  htsmsg_t *map = NULL;
+
+  if ((map = htsmsg_create_map())) {
+    htsmsg_add_str(map, "key", key);
+    htsmsg_add_str(map, "val", val);
+    htsmsg_add_msg(list, NULL, map);
+    return 0;
+  }
+  return -1;
 }
 
 static htsmsg_t *
-profile_class_language_list(void *o, const char *lang)
+profile_class_codec_profile_make_list(const char *lang)
 {
-  htsmsg_t *l = htsmsg_create_list();
-  const lang_code_t *lc = lang_codes;
-  char buf[128];
+  htsmsg_t *list = NULL;
 
-  while (lc->code2b) {
-    htsmsg_t *e;
-    if (!strcmp(lc->code2b, "und")) {
-      e = htsmsg_create_key_val("", tvh_gettext_lang(lang, N_("Use original")));
-    } else {
-      snprintf(buf, sizeof(buf), "%s (%s)", lc->desc, lc->code2b);
-      buf[sizeof(buf)-1] = '\0';
-      e = htsmsg_create_key_val(lc->code2b, buf);
+  if ((list = htsmsg_create_list())) {
+    if (htsmsg_add_entry(list, "", tvh_gettext_lang(lang, N_("Disabled"))) ||
+      htsmsg_add_entry(list, "copy", tvh_gettext_lang(lang, N_("Copy")))) {
+      htsmsg_destroy(list);
+      list = NULL;
     }
-    htsmsg_add_msg(l, NULL, e);
-    lc++;
   }
-  return l;
-}
-
-static inline int
-profile_class_check_sct(htsmsg_t *c, int sct)
-{
-  htsmsg_field_t *f;
-  int64_t x;
-  HTSMSG_FOREACH(f, c)
-    if (!htsmsg_field_get_s64(f, &x))
-      if (x == sct)
-        return 1;
-  return 0;
+  return list;
 }
 
 static htsmsg_t *
-profile_class_codec_list(int (*check)(int sct), const char *lang)
+profile_class_codec_profiles_list(enum AVMediaType media_type, const char *lang)
 {
-  htsmsg_t *l = htsmsg_create_list(), *e, *c, *m;
-  htsmsg_field_t *f;
-  const char *s, *s2;
-  char buf[128];
-  int sct;
+  htsmsg_t *list = NULL, *profiles = NULL, *map = NULL;
+  htsmsg_field_t *field;
 
-  e = htsmsg_create_key_val("", tvh_gettext_lang(lang, N_("Do not use")));
-  htsmsg_add_msg(l, NULL, e);
-  e = htsmsg_create_key_val("copy", tvh_gettext_lang(lang, N_("Copy codec type")));
-  htsmsg_add_msg(l, NULL, e);
-  c = transcoder_get_capabilities(profile_transcode_experimental_codecs);
-  HTSMSG_FOREACH(f, c) {
-    if (!(m = htsmsg_field_get_map(f)))
-      continue;
-    if (htsmsg_get_s32(m, "type", &sct))
-      continue;
-    if (!check(sct))
-      continue;
-    if (!(s = htsmsg_get_str(m, "name")))
-      continue;
-    s2 = htsmsg_get_str(m, "long_name");
-    if (s2)
-      snprintf(buf, sizeof(buf), "%s: %s", s, s2);
-    else
-      snprintf(buf, sizeof(buf), "%s", s);
-    e = htsmsg_create_key_val(s, buf);
-    htsmsg_add_msg(l, NULL, e);
+  if ((list = profile_class_codec_profile_make_list(lang)) &&
+      (profiles = codec_get_profiles_list(media_type))) {
+    HTSMSG_FOREACH(field, profiles) {
+      if (!(map = htsmsg_detach_submsg(field))) {
+        htsmsg_destroy(list);
+        list = NULL;
+        break;
+      }
+      htsmsg_add_msg(list, NULL, map);
+    }
+    htsmsg_destroy(profiles);
+    profiles = NULL;
   }
-  htsmsg_destroy(c);
-  return l;
+  return list;
+}
+
+static htsmsg_t *
+profile_class_pro_vcodec_list(void *o, const char *lang)
+{
+  return profile_class_codec_profiles_list(AVMEDIA_TYPE_VIDEO, lang);
 }
 
 static int
-profile_class_vcodec_sct_check(int sct)
+profile_class_src_codec_set(profile_transcode_t *pro,
+                            char **str,
+                            const void *p)
 {
-  return SCT_ISVIDEO(sct);
+  char *s = htsmsg_list_2_csv((htsmsg_t *)p, ',', 0);
+  int change = 0;
+  if (s) {
+    change = strcmp(*str ?: "", s) != 0;
+    free(*str);
+    *str = s;
+  }
+  return change;
 }
 
-static htsmsg_t *
-profile_class_vcodec_list(void *o, const char *lang)
+static const void *
+profile_class_src_codec_get(profile_transcode_t *pro,
+                            char *str)
 {
-  return profile_class_codec_list(profile_class_vcodec_sct_check, lang);
+  return htsmsg_csv_2_list(str, ',');
 }
 
-static htsmsg_t *
-profile_class_vcodec_preset_list(void *o, const char *lang)
-{
-  static const struct strtab_str tab[] = {
-    {N_("ultrafast: h264 / h265")                    , "ultrafast" },
-    {N_("superfast: h264 / h265")                    , "superfast" },
-    {N_("veryfast: h264 / h265 / qsv(h264)")         , "veryfast"  },
-    {N_("faster: h264 / h265 / qsv(h264)")           , "faster"    },
-    {N_("fast: h264 / h265 / qsv(h264 / h265)")      , "fast"      },
-    {N_("medium: h264 / h265 / qsv(h264 / h265)")    , "medium"    },
-    {N_("slow: h264 / h265 / qsv(h264 / h265)")      , "slow"      },
-    {N_("slower: h264 / h265 / qsv(h264)")           , "slower"    },
-    {N_("veryslow: h264 / h265 / qsv(h264)")         , "veryslow"  },
-    {N_("placebo: h264 / h265")                      , "placebo"   },
-    {N_("hq: nvenc(h264 / h265)")                    , "hq"        },
-    {N_("hp: nvenc(h264 / h265)")                    , "hp"        },
-    {N_("bd: nvenc(h264 / h265)")                    , "bd"        },
-    {N_("ll: nvenc(h264 / h265)")                    , "ll"        },
-    {N_("llhq: nvenc(h264 / h265)")                  , "llhq"      },
-    {N_("llhp: nvenc(h264 / h265)")                  , "llhp"      },
-    {N_("default: nvenc(h264 / h265)")               , "default"   }
-  };
-  return strtab2htsmsg_str(tab, 1, lang);
-}
+static const struct strtab_str profile_class_src_vcodec_tab[] = {
+  { "MPEG2VIDEO",            "MPEG2VIDEO" },
+  { "H264",                  "H264" },
+  { "VP8",                   "VP8" },
+  { "HEVC",                  "HEVC" },
+  { "VP9",                   "VP9" },
+  { "THEORA",                "THEORA" },
+};
 
 static int
-profile_class_acodec_sct_check(int sct)
+profile_class_src_vcodec_set ( void *obj, const void *p )
 {
-  return SCT_ISAUDIO(sct);
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_set(pro, &pro->pro_src_vcodec, p);
+}
+
+static const void *
+profile_class_src_vcodec_get ( void *obj )
+{
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_get(pro, pro->pro_src_vcodec);
 }
 
 static htsmsg_t *
-profile_class_acodec_list(void *o, const char *lang)
+profile_class_src_vcodec_list ( void *o, const char *lang )
 {
-  return profile_class_codec_list(profile_class_acodec_sct_check, lang);
+  return strtab2htsmsg_str(profile_class_src_vcodec_tab, 1, lang);
 }
+
+static htsmsg_t *
+profile_class_pro_acodec_list(void *o, const char *lang)
+{
+  return profile_class_codec_profiles_list(AVMEDIA_TYPE_AUDIO, lang);
+}
+
+static const struct strtab_str profile_class_src_acodec_tab[] = {
+  { "MPEG2AUDIO",            "MPEG2AUDIO" },
+  { "AC3",                   "AC3" },
+  { "AAC",                   "AAC" },
+  { "MP4A",                  "MP4A" },
+  { "EAC3",                  "EAC3" },
+  { "VORBIS",                "VORBIS" },
+  { "OPUS",                  "OPUS" },
+};
 
 static int
-profile_class_scodec_sct_check(int sct)
+profile_class_src_acodec_set ( void *obj, const void *p )
 {
-  return SCT_ISSUBTITLE(sct);
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_set(pro, &pro->pro_src_acodec, p);
+}
+
+static const void *
+profile_class_src_acodec_get ( void *obj )
+{
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_get(pro, pro->pro_src_acodec);
 }
 
 static htsmsg_t *
-profile_class_scodec_list(void *o, const char *lang)
+profile_class_src_acodec_list ( void *o, const char *lang )
 {
-  return profile_class_codec_list(profile_class_scodec_sct_check, lang);
+  return strtab2htsmsg_str(profile_class_src_acodec_tab, 1, lang);
+}
+
+static htsmsg_t *
+profile_class_pro_scodec_list(void *o, const char *lang)
+{
+  return profile_class_codec_profiles_list(AVMEDIA_TYPE_SUBTITLE, lang);
+}
+
+static const struct strtab_str profile_class_src_scodec_tab[] = {
+  { "DVBSUB",                "DVBSUB" },
+  { "TEXTSUB",               "TEXTSUB" },
+};
+
+static int
+profile_class_src_scodec_set ( void *obj, const void *p )
+{
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_set(pro, &pro->pro_src_scodec, p);
+}
+
+static const void *
+profile_class_src_scodec_get ( void *obj )
+{
+  profile_transcode_t *pro = (profile_transcode_t *)obj;
+  return profile_class_src_codec_get(pro, pro->pro_src_scodec);
+}
+
+static htsmsg_t *
+profile_class_src_scodec_list ( void *o, const char *lang )
+{
+  return strtab2htsmsg_str(profile_class_src_scodec_tab, 1, lang);
 }
 
 const idclass_t profile_transcode_class =
@@ -2134,144 +2241,74 @@ const idclass_t profile_transcode_class =
       .group    = 1
     },
     {
-      .type     = PT_U32,
-      .id       = "resolution",
-      .name     = N_("Resolution (height)"),
-      .desc     = N_("Vertical resolution (height) of the output video "
-                     "stream. Horizontal resolution is adjusted "
-                     "automatically to preserve aspect ratio. When set "
-                     "to 0, the input resolution is used."),
-      .off      = offsetof(profile_transcode_t, pro_resolution),
-      .def.u32  = 384,
-      .group    = 2
-    },
-    {
-      .type     = PT_U32,
-      .id       = "channels",
-      .name     = N_("Channels"),
-      .desc     = N_("Audio channel layout."),
-      .off      = offsetof(profile_transcode_t, pro_channels),
-      .def.u32  = 2,
-      .list     = profile_class_channels_list,
+      .type     = PT_STR,
+      .id       = "pro_vcodec",
+      .name     = N_("Video codec profile"),
+      .desc     = N_("Select video codec profile to use for transcoding."),
+      .off      = offsetof(profile_transcode_t, pro_vcodec),
+      .list     = profile_class_pro_vcodec_list,
       .opts     = PO_ADVANCED,
       .group    = 2
     },
     {
       .type     = PT_STR,
-      .id       = "language",
-      .name     = N_("Language"),
-      .desc     = N_("Preferred audio language."),
-      .off      = offsetof(profile_transcode_t, pro_language),
-      .list     = profile_class_language_list,
-      .opts     = PO_ADVANCED,
-      .group    = 2
-    },
-    {
-      .type     = PT_STR,
+      .islist   = 1,
       .id       = "src_vcodec",
       .name     = N_("Source video codec"),
-      .desc     = N_("Transcode video only if source video codec matches. "
-                     "\"Any\" ignores source video codec checking and "
-                     "always transcodes. If no codec match is found, "
-                     "transcoding is done using the \"copy\" codec. "
-                     "if a match is found, transcode with the "
-                     "parameters in this profile. Separate codec names "
-                     "with comma."),
-      .off      = offsetof(profile_transcode_t, pro_src_vcodec),
-      .def.i    = SCT_UNKNOWN,
+      .desc     = N_("Transcode video only for selected codecs."),
+      .get      = profile_class_src_vcodec_get,
+      .set      = profile_class_src_vcodec_set,
       .list     = profile_class_src_vcodec_list,
       .opts     = PO_ADVANCED,
       .group    = 2
     },
     {
       .type     = PT_STR,
-      .id       = "vcodec",
-      .name     = N_("Video codec"),
-      .desc     = N_("Video codec to use for the transcode. "
-                     "\"Do not use\" will disable video output."),
-      .off      = offsetof(profile_transcode_t, pro_vcodec),
-      .def.s    = "libx264",
-      .list     = profile_class_vcodec_list,
-      .opts     = PO_ADVANCED,
-      .group    = 2
-    },
-    {
-      .type     = PT_STR,
-      .id       = "vcodec_preset",
-      .name     = N_("Video codec preset"),
-      .desc     = N_("Video codec preset to use for transcoding."),
-      .off      = offsetof(profile_transcode_t, pro_vcodec_preset),
-      .def.s    = "faster",
-      .list     = profile_class_vcodec_preset_list,
-      .opts     = PO_ADVANCED,
-      .group    = 2
-    },
-    {
-      .type     = PT_U32,
-      .id       = "vbitrate",
-      .name     = N_("Video bitrate (kb/s) (0=auto)"),
-      .desc     = N_("Bitrate to use for the transcode. See Help for "
-                     "details."),
-      .off      = offsetof(profile_transcode_t, pro_vbitrate),
-      .opts     = PO_ADVANCED,
-      .def.u32  = 0,
-      .group    = 2
-    },
-    {
-      .type     = PT_STR,
-      .id       = "acodec",
-      .name     = N_("Audio codec"),
-      .desc     = N_("Audio codec to use for the transcode. \"Do not "
-                     "use\" will disable audio output."),
+      .id       = "pro_acodec",
+      .name     = N_("Audio codec profile"),
+      .desc     = N_("Select audio codec profile to use for transcoding."),
       .off      = offsetof(profile_transcode_t, pro_acodec),
-      .def.s    = "libvorbis",
-      .list     = profile_class_acodec_list,
+      .list     = profile_class_pro_acodec_list,
       .opts     = PO_ADVANCED,
-      .group    = 2
-    },
-    {
-      .type     = PT_U32,
-      .id       = "abitrate",
-      .name     = N_("Audio bitrate (kb/s) (0=auto)"),
-      .desc     = N_("Audio bitrate to use for transcoding."),
-      .off      = offsetof(profile_transcode_t, pro_abitrate),
-      .opts     = PO_ADVANCED,
-      .def.u32  = 0,
       .group    = 2
     },
     {
       .type     = PT_STR,
-      .id       = "scodec",
-      .name     = N_("Subtitle codec"),
-      .desc     = N_("Select subtitle codec to use for transcoding."),
+      .islist   = 1,
+      .id       = "src_acodec",
+      .name     = N_("Source audio codec"),
+      .desc     = N_("Transcode audio only for selected codecs."),
+      .get      = profile_class_src_acodec_get,
+      .set      = profile_class_src_acodec_set,
+      .list     = profile_class_src_acodec_list,
+      .opts     = PO_ADVANCED,
+      .group    = 2
+    },
+    {
+      .type     = PT_STR,
+      .id       = "pro_scodec",
+      .name     = N_("Subtitle codec profile"),
+      .desc     = N_("Select subtitle codec profile to use for transcoding."),
       .off      = offsetof(profile_transcode_t, pro_scodec),
-      .def.s    = "",
-      .list     = profile_class_scodec_list,
+      .list     = profile_class_pro_scodec_list,
+      .opts     = PO_ADVANCED,
+      .group    = 2
+    },
+    {
+      .type     = PT_STR,
+      .islist   = 1,
+      .id       = "src_scodec",
+      .name     = N_("Source subtitle codec"),
+      .desc     = N_("Transcode subtitle only for selected codecs."),
+      .get      = profile_class_src_scodec_get,
+      .set      = profile_class_src_scodec_set,
+      .list     = profile_class_src_scodec_list,
       .opts     = PO_ADVANCED,
       .group    = 2
     },
     { }
   }
 };
-
-static int
-profile_transcode_resolution(profile_transcode_t *pro)
-{
-  return pro->pro_resolution == 0 ? 0 :
-         (pro->pro_resolution >= 240 ? pro->pro_resolution : 240);
-}
-
-static int
-profile_transcode_vbitrate(profile_transcode_t *pro)
-{
-  return pro->pro_vbitrate;
-}
-
-static int
-profile_transcode_abitrate(profile_transcode_t *pro)
-{
-  return pro->pro_abitrate;
-}
 
 static int
 profile_transcode_can_share(profile_chain_t *prch,
@@ -2289,19 +2326,15 @@ profile_transcode_can_share(profile_chain_t *prch,
    */
   if (strcmp(pro1->pro_vcodec ?: "", pro2->pro_vcodec ?: ""))
     return 0;
-  if (strcmp(pro1->pro_vcodec_preset ?: "", pro2->pro_vcodec_preset ?: ""))
+  if (strcmp(pro1->pro_src_vcodec ?: "", pro2->pro_src_vcodec ?: ""))
     return 0;
   if (strcmp(pro1->pro_acodec ?: "", pro2->pro_acodec ?: ""))
     return 0;
+  if (strcmp(pro1->pro_src_acodec ?: "", pro2->pro_src_acodec ?: ""))
+    return 0;
   if (strcmp(pro1->pro_scodec ?: "", pro2->pro_scodec ?: ""))
     return 0;
-  if (profile_transcode_resolution(pro1) != profile_transcode_resolution(pro2))
-    return 0;
-  if (profile_transcode_vbitrate(pro1) != profile_transcode_vbitrate(pro2))
-    return 0;
-  if (profile_transcode_abitrate(pro1) != profile_transcode_abitrate(pro2))
-    return 0;
-  if (strcmp(pro1->pro_language ?: "", pro2->pro_language ?: ""))
+  if (strcmp(pro1->pro_src_scodec ?: "", pro2->pro_src_scodec ?: ""))
     return 0;
   return 1;
 }
@@ -2313,30 +2346,22 @@ profile_transcode_work(profile_chain_t *prch,
 {
   profile_sharer_t *prsh;
   profile_transcode_t *pro = (profile_transcode_t *)prch->prch_pro;
-  transcoder_props_t props;
+  const char *profiles[AVMEDIA_TYPE_NB] = { NULL };
+  const char *src_codecs[AVMEDIA_TYPE_NB] = { NULL };
 
   prsh = profile_sharer_find(prch);
   if (!prsh)
     goto fail;
 
-  memset(&props, 0, sizeof(props));
-  strncpy(props.tp_vcodec, pro->pro_vcodec ?: "", sizeof(props.tp_vcodec)-1);
-  strncpy(props.tp_vcodec_preset, pro->pro_vcodec_preset ?: "", sizeof(props.tp_vcodec_preset)-1);
-  strncpy(props.tp_acodec, pro->pro_acodec ?: "", sizeof(props.tp_acodec)-1);
-  strncpy(props.tp_scodec, pro->pro_scodec ?: "", sizeof(props.tp_scodec)-1);
-  props.tp_resolution = profile_transcode_resolution(pro);
-  props.tp_channels   = pro->pro_channels;
-  props.tp_vbitrate   = profile_transcode_vbitrate(pro);
-  props.tp_abitrate   = profile_transcode_abitrate(pro);
-  strncpy(props.tp_language, pro->pro_language ?: "", 3);
+  prch->prch_can_share = profile_transcode_can_share;
 
-  if (!pro->pro_src_vcodec) {
-     strcpy(props.tp_src_vcodec, "");
-  } else if(!strncasecmp("Any",pro->pro_src_vcodec,3)) {
-     strcpy(props.tp_src_vcodec, "");
-  } else {
-     strncpy(props.tp_src_vcodec, pro->pro_src_vcodec ?: "", sizeof(props.tp_src_vcodec)-1);
-  }
+  profiles[AVMEDIA_TYPE_VIDEO] = pro->pro_vcodec ?: "";
+  profiles[AVMEDIA_TYPE_AUDIO] = pro->pro_acodec ?: "";
+  profiles[AVMEDIA_TYPE_SUBTITLE] = pro->pro_scodec ?: "";
+
+  src_codecs[AVMEDIA_TYPE_VIDEO] = pro->pro_src_vcodec ?: "";
+  src_codecs[AVMEDIA_TYPE_AUDIO] = pro->pro_src_acodec ?: "";
+  src_codecs[AVMEDIA_TYPE_SUBTITLE] = pro->pro_src_scodec ?: "";
 
   dst = prch->prch_gh = globalheaders_create(dst);
 
@@ -2348,10 +2373,10 @@ profile_transcode_work(profile_chain_t *prch,
     goto fail;
   if (!prsh->prsh_transcoder) {
     assert(!prsh->prsh_tsfix);
-    dst = prsh->prsh_transcoder = transcoder_create(&prsh->prsh_input);
+    dst = prsh->prsh_transcoder = transcoder_create(&prsh->prsh_input,
+                                                    profiles, src_codecs);
     if (!dst)
       goto fail;
-    transcoder_set_properties(dst, &props);
     prsh->prsh_tsfix = tsfix_create(dst);
   }
   prch->prch_share = prsh->prsh_tsfix;
@@ -2390,13 +2415,14 @@ profile_transcode_mc_valid(int mc)
 
 static int
 profile_transcode_reopen(profile_chain_t *prch,
-                         muxer_config_t *m_cfg, int flags)
+                         muxer_config_t *m_cfg,
+                         muxer_hints_t *hints, int flags)
 {
   profile_transcode_t *pro = (profile_transcode_t *)prch->prch_pro;
   muxer_config_t c;
 
   if (m_cfg)
-    c = *m_cfg; /* do not alter the original parameter */
+    muxer_config_copy(&c, m_cfg); /* do not alter the original parameter */
   else
     memset(&c, 0, sizeof(c));
   if (!profile_transcode_mc_valid(c.m_type)) {
@@ -2406,13 +2432,15 @@ profile_transcode_reopen(profile_chain_t *prch,
   }
 
   assert(!prch->prch_muxer);
-  prch->prch_muxer = muxer_create(&c);
+  prch->prch_muxer = muxer_create(&c, hints);
   return 0;
 }
 
 static int
 profile_transcode_open(profile_chain_t *prch,
-                       muxer_config_t *m_cfg, int flags, size_t qsize)
+                       muxer_config_t *m_cfg,
+                       muxer_hints_t *hints,
+                       int flags, size_t qsize)
 {
   int r;
 
@@ -2427,15 +2455,7 @@ profile_transcode_open(profile_chain_t *prch,
     return r;
   }
 
-  profile_transcode_reopen(prch, m_cfg, flags);
-  return 0;
-}
-
-static muxer_container_type_t
-profile_transcode_get_mc(profile_t *_pro)
-{
-  profile_transcode_t *pro = (profile_transcode_t *)_pro;
-  return pro->pro_mc;
+  return profile_transcode_reopen(prch, m_cfg, hints, flags);
 }
 
 static void
@@ -2443,10 +2463,11 @@ profile_transcode_free(profile_t *_pro)
 {
   profile_transcode_t *pro = (profile_transcode_t *)_pro;
   free(pro->pro_vcodec);
-  free(pro->pro_vcodec_preset);
-  free(pro->pro_acodec);
-  free(pro->pro_scodec);
   free(pro->pro_src_vcodec);
+  free(pro->pro_acodec);
+  free(pro->pro_src_acodec);
+  free(pro->pro_scodec);
+  free(pro->pro_src_scodec);
 }
 
 static profile_t *
@@ -2458,7 +2479,6 @@ profile_transcode_builder(void)
   pro->pro_work   = profile_transcode_work;
   pro->pro_reopen = profile_transcode_reopen;
   pro->pro_open   = profile_transcode_open;
-  pro->pro_get_mc = profile_transcode_get_mc;
   return (profile_t *)pro;
 }
 
@@ -2480,6 +2500,7 @@ profile_init(void)
   LIST_INIT(&profile_chains);
 
   profile_register(&profile_mpegts_pass_class, profile_mpegts_pass_builder);
+  profile_register(&profile_mpegts_spawn_class, profile_mpegts_spawn_builder);
   profile_register(&profile_matroska_class, profile_matroska_builder);
   profile_register(&profile_htsp_class, profile_htsp_builder);
   profile_register(&profile_audio_class, profile_audio_builder);
@@ -2487,8 +2508,6 @@ profile_init(void)
   profile_register(&profile_libav_mpegts_class, profile_libav_mpegts_builder);
   profile_register(&profile_libav_matroska_class, profile_libav_matroska_builder);
   profile_register(&profile_libav_mp4_class, profile_libav_mp4_builder);
-  profile_transcode_experimental_codecs =
-    getenv("TVHEADEND_LIBAV_NO_EXPERIMENTAL_CODECS") ? 0 : 1;
   profile_register(&profile_transcode_class, profile_transcode_builder);
 #endif
 
@@ -2501,146 +2520,61 @@ profile_init(void)
     htsmsg_destroy(c);
   }
 
-  name = "pass";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-mpegts");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_bool(conf, "default", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("MPEG-TS Pass-thru"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_bool(conf, "rewrite_pmt", 1);
-    htsmsg_add_bool(conf, "rewrite_pat", 1);
-    htsmsg_add_bool(conf, "rewrite_sdt", 1);
-    htsmsg_add_bool(conf, "rewrite_eit", 1);
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
-  }
-
-  name = "matroska";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-matroska");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("Matroska"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
-  }
-
-  name = "htsp";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-htsp");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("HTSP Default Stream Settings"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_IMPORTANT);
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
-  }
-
-  name = "audio";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-audio");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("Audio-only stream"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
+  if ((c = hts_settings_load("profiles")) != NULL) {
+    HTSMSG_FOREACH(f, c) {
+      if (!(e = htsmsg_field_get_map(f)))
+        continue;
+      if ((name = htsmsg_get_str(e, "name")) == NULL)
+        continue;
+      pro = profile_find_by_name2(name, NULL, 1);
+      if (pro == NULL || strcmp(profile_get_name(pro), name)) {
+        if (!htsmsg_field_find(e, "enabled"))
+          htsmsg_add_bool(e, "enabled", 1);
+        if (!htsmsg_field_find(e, "priority"))
+          htsmsg_add_s32(e, "priority", PROFILE_SPRIO_NORMAL);
+        if (!htsmsg_field_find(e, "shield"))
+          htsmsg_add_bool(e, "shield", 1);
+        (void)profile_create(NULL, e, 1);
+      }
+    }
+    htsmsg_destroy(c);
   }
 
 #if ENABLE_LIBAV
-
-  name = "webtv-vp8-vorbis-webm";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-transcode");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("WEBTV profile VP8/Vorbis/WEBM"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_s32 (conf, "container", MC_WEBM);
-    htsmsg_add_u32 (conf, "resolution", 384);
-    htsmsg_add_u32 (conf, "channels", 2);
-    htsmsg_add_str (conf, "vcodec", "libvpx");
-    htsmsg_add_str (conf, "vcodec_preset", "faster");
-    htsmsg_add_str (conf, "acodec", "libvorbis");
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
-  }
-  name = "webtv-h264-aac-mpegts";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-transcode");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("WEBTV profile H264/AAC/MPEG-TS"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_s32 (conf, "container", MC_MPEGTS);
-    htsmsg_add_u32 (conf, "resolution", 384);
-    htsmsg_add_u32 (conf, "channels", 2);
-    htsmsg_add_str (conf, "vcodec", "libx264");
-    htsmsg_add_str (conf, "vcodec_preset", "faster");
-    htsmsg_add_str (conf, "acodec", "aac");
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
-  }
-  name = "webtv-h264-aac-matroska";
-  pro = profile_find_by_name2(name, NULL, 1);
-  if (pro == NULL || strcmp(profile_get_name(pro), name)) {
-    htsmsg_t *conf;
-
-    conf = htsmsg_create_map();
-    htsmsg_add_str (conf, "class", "profile-transcode");
-    htsmsg_add_bool(conf, "enabled", 1);
-    htsmsg_add_str (conf, "name", name);
-    htsmsg_add_str (conf, "comment", _("WEBTV profile H264/AAC/Matroska"));
-    htsmsg_add_s32 (conf, "priority", PROFILE_SPRIO_NORMAL);
-    htsmsg_add_s32 (conf, "container", MC_MATROSKA);
-    htsmsg_add_u32 (conf, "resolution", 384);
-    htsmsg_add_u32 (conf, "channels", 2);
-    htsmsg_add_str (conf, "vcodec", "libx264");
-    htsmsg_add_str (conf, "vcodec_preset", "faster");
-    htsmsg_add_str (conf, "acodec", "aac");
-    htsmsg_add_bool(conf, "shield", 1);
-    (void)profile_create(NULL, conf, 1);
-    htsmsg_destroy(conf);
+  if ((c = hts_settings_load("transcoder/profiles")) != NULL) {
+    HTSMSG_FOREACH(f, c) {
+      if (!(e = htsmsg_field_get_map(f)))
+        continue;
+      if ((name = htsmsg_get_str(e, "name")) == NULL)
+        continue;
+      pro = profile_find_by_name2(name, NULL, 1);
+      if (pro == NULL || strcmp(profile_get_name(pro), name)) {
+transcoder_create:
+        htsmsg_add_str(e, "class", "profile-transcode");
+        if (!htsmsg_field_find(e, "enabled"))
+          htsmsg_add_bool(e, "enabled", 1);
+        if (!htsmsg_field_find(e, "priority"))
+          htsmsg_add_s32(e, "priority", PROFILE_SPRIO_NORMAL);
+        if (!htsmsg_field_find(e, "shield"))
+          htsmsg_add_bool(e, "shield", 1);
+        (void)profile_create(NULL, e, 1);
+      } else if (pro && idnode_is_instance(&pro->pro_id, &profile_transcode_class)) {
+        profile_transcode_t *prot = (profile_transcode_t *)pro;
+        if (tvh_str_default(prot->pro_vcodec, NULL) == NULL) {
+          profile_delete(pro, 1);
+          goto transcoder_create;
+        }
+      }
+    }
+    htsmsg_destroy(c);
   }
 #endif
 
   /* Assign the default profile if config files are corrupted */
   if (!profile_default) {
     pro = profile_find_by_name2("pass", NULL, 1);
-    assert(pro);
+    if (pro == NULL)
+      tvhabort(LS_PROFILE, "no default streaming profile! reinstall data files");
     profile_default = pro;
   }
 }

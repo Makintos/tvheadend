@@ -291,6 +291,8 @@ bouquet_map_channel(bouquet_t *bq, service_t *t)
     .check_availability = 0,
     .encrypted          = 1,
     .merge_same_name    = 0,
+    .merge_same_name_fuzzy = 0,
+    .tidy_channel_name  = 0,
     .type_tags          = 0,
     .provider_tags      = 0,
     .network_tags       = 0
@@ -313,6 +315,8 @@ bouquet_map_channel(bouquet_t *bq, service_t *t)
   if (!ilm) {
     sm_conf.encrypted = bq->bq_mapencrypted;
     sm_conf.merge_same_name = bq->bq_mapmergename;
+    sm_conf.merge_same_name_fuzzy = bq->bq_mapmergefuzzy;
+    sm_conf.tidy_channel_name = bq->bq_tidychannelname;
     sm_conf.type_tags = bq->bq_chtag_type_tags;
     sm_conf.provider_tags = bq->bq_chtag_provider_tags;
     sm_conf.network_tags = bq->bq_chtag_network_tags;
@@ -663,7 +667,8 @@ bouquet_class_save(idnode_t *self, char *filename, size_t fsize)
   htsmsg_t *c = htsmsg_create_map();
   char ubuf[UUID_HEX_SIZE];
   idnode_save(&bq->bq_id, c);
-  snprintf(filename, fsize, "bouquet/%s", idnode_uuid_as_str(&bq->bq_id, ubuf));
+  if (filename)
+    snprintf(filename, fsize, "bouquet/%s", idnode_uuid_as_str(&bq->bq_id, ubuf));
   if (bq->bq_shield)
     htsmsg_add_bool(c, "shield", 1);
   bq->bq_saveflag = 0;
@@ -746,6 +751,16 @@ static idnode_slist_t bouquest_class_mapopt_slist[] = {
     .id   = "merge_name",
     .name = N_("Merge same name"),
     .off  = offsetof(bouquet_t, bq_mapmergename),
+  },
+  {
+    .id   = "merge_same_name_fuzzy",
+    .name = N_("Use fuzzy mapping if merging same name"),
+    .off  = offsetof(bouquet_t, bq_mapmergefuzzy),
+  },
+  {
+    .id   = "tidy_channel_name",
+    .name = N_("Tidy channel name (e.g., stripping HD/UHD suffix)"),
+    .off  = offsetof(bouquet_t, bq_tidychannelname),
   },
   {}
 };
@@ -877,14 +892,13 @@ bouquet_class_chtag_notify ( void *obj, const char *lang )
 static const void *
 bouquet_class_chtag_ref_get ( void *obj )
 {
-  static const char *buf;
   bouquet_t *bq = obj;
 
   if (bq->bq_chtag_ptr)
-    buf = idnode_uuid_as_str(&bq->bq_chtag_ptr->ct_id, prop_sbuf);
+    idnode_uuid_as_str(&bq->bq_chtag_ptr->ct_id, prop_sbuf);
   else
-    buf = "";
-  return &buf;
+    prop_sbuf[0] = '\0';
+  return &prop_sbuf_ptr;
 }
 
 static char *

@@ -68,9 +68,10 @@ tvheadend.DurationStore = new Ext.data.SimpleStore({
     data: [['-1', _('(Clear filter)'),"",""],
            ['1',_('00:00:00 - 00:15:00'), 0, 900],
            ['2',_('00:15:00 - 00:30:00'), 900, 1800],
-           ['3',_('00:30:00 - 01:30:00'), 1800, 5400],
-           ['4',_('01:30:00 - 03:00:00'), 5400, 10800],
-           ['5',_('03:00:00 - No maximum'), 10800, 9999999]]
+           ['3',_('00:30:00 - 01:00:00'), 1800, 3600],
+           ['4',_('01:00:00 - 01:30:00'), 3600, 5400],
+           ['5',_('01:30:00 - 03:00:00'), 5400, 10800],
+           ['6',_('03:00:00 - No maximum'), 10800, 9999999]]
 });
 
 // Function to convert numeric duration to corresponding label string
@@ -102,9 +103,16 @@ tvheadend.epgDetails = function(event) {
 
     if (chicon)
         content += '<div class="x-epg-left">';
+    var icons = tvheadend.getContentTypeIcons(event);
+    if (icons)
+        content += '<div class="x-epg-icons">' + icons + '</div>';
     content += '<div class="x-epg-title">' + event.title;
-    if (event.subtitle)
+    // Some OTA have the same subtitle and summary so don't display subtitle
+    // since summary can be long.
+    if (event.subtitle && (!event.summary || (event.summary && event.subtitle != event.summary)))
         content += "&nbsp;:&nbsp;" + event.subtitle;
+    if (event.copyright_year)
+        content += "&nbsp;(" + event.copyright_year + ")";
     content += '</div>';
     if (event.episodeOnscreen)
         content += '<div class="x-epg-title">' + event.episodeOnscreen + '</div>';
@@ -112,6 +120,8 @@ tvheadend.epgDetails = function(event) {
       content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Start Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(event.start) + '</span></div>';
     if (event.stop)
       content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('End Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(event.stop) + '</span></div>';
+    if (event.first_aired)
+      content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('First Aired') + ':</span><span class="x-epg-body">' + tvheadend.niceDateYearMonth(event.first_aired, event.start) + '</span></div>';
     if (duration)
       content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Duration') + ':</span><span class="x-epg-body">' + parseInt(duration / 60) + ' ' + _('min') + '</span></div>';
     if (chicon) {
@@ -128,10 +138,15 @@ tvheadend.epgDetails = function(event) {
       content += '<div class="x-epg-desc">' + event.description + '</div>';
     if (event.summary || event.description)
       content += '<hr class="x-epg-hr"/>';
+    content += tvheadend.getDisplayCredits(event.credits);
+    if (event.keyword)
+      content += tvheadend.sortAndAddArray(event.keyword, _('Keywords'));
+    if (event.category)
+      content += tvheadend.sortAndAddArray(event.category, _('Categories'));
     if (event.starRating)
-      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Star Rating') + ':</span><span class="x-epg-body">' + event.starRating + '</span></div>';
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Star Rating') + ':</span><span class="x-epg-desc">' + event.starRating + '</span></div>';
     if (event.ageRating)
-      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Age Rating') + ':</span><span class="x-epg-body">' + event.ageRating + '</span></div>';
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Age Rating') + ':</span><span class="x-epg-desc">' + event.ageRating + '</span></div>';
     if (event.genre) {
       var genre = [];
       Ext.each(event.genre, function(g) {
@@ -366,7 +381,7 @@ tvheadend.epg = function() {
         new tvheadend.VideoPlayer(item.data.channelUuid);
     };
 
-    var actions = new Ext.ux.grid.RowActions({
+    var eventdetails = new Ext.ux.grid.RowActions({
         id: 'details',
         header: _('Details'),
         tooltip: _('Details'),
@@ -386,14 +401,23 @@ tvheadend.epg = function() {
                 cb: detailsfcn
             },
             {
+                iconIndex: 'dvrState'
+            }
+        ]
+    });
+
+    var eventactions = new Ext.ux.grid.RowActions({
+        id: 'eventactions',
+        header: _('Actions'),
+        tooltip: _('Actions'),
+        width: 67,
+        dataIndex: 'actions',
+        actions: [
+            {
                 iconCls: 'watchTv',
                 qtip: _('Watch TV'),
                 cb: watchfcn
-            },
-            {
-                iconIndex: 'dvrState'
             }
-                                                                                                          
         ]
     });
 
@@ -428,8 +452,18 @@ tvheadend.epg = function() {
                 type: 'date',
                 dateFormat: 'U' /* unix time */
             },
+            {
+                name: 'first_aired',
+                type: 'date',
+                dateFormat: 'U' /* unix time */
+            },
             { name: 'starRating' },
+            { name: 'credits' },
+            { name: 'category' },
+            { name: 'keyword' },
             { name: 'ageRating' },
+            { name: 'copyright_year' },
+            { name: 'new' },
             { name: 'genre' },
             { name: 'dvrUuid' },
             { name: 'dvrState' },
@@ -502,7 +536,8 @@ tvheadend.epg = function() {
     var epgCm = new Ext.grid.ColumnModel({
         defaultSortable: true,
         columns: [
-            actions,
+            eventdetails,
+            eventactions,
             new Ext.ux.grid.ProgressColumn({
                 width: 100,
                 header: _("Progress"),
@@ -525,6 +560,7 @@ tvheadend.epg = function() {
                         return "";
                 }
             }),
+            tvheadend.contentTypeAction,
             {
                 width: 250,
                 id: 'title',
@@ -535,6 +571,7 @@ tvheadend.epg = function() {
                     var clickable = tvheadend.regexEscape(record.data['title']) !=
                                     epgStore.baseParams.title;
                     setMetaAttr(meta, record, value && clickable);
+                    value = tvheadend.getDisplayTitle(value, record);
                     return !value ? '' : (clickable ? lookup : '') + value;
                 },
                 listeners: { click: { fn: clicked } }
@@ -977,7 +1014,7 @@ tvheadend.epg = function() {
         stateId: 'epggrid',
         enableDragDrop: false,
         cm: epgCm,
-        plugins: [filter, actions],
+        plugins: [filter, eventdetails, eventactions],
         title: _('Electronic Program Guide'),
         iconCls: 'epg',
         store: epgStore,
@@ -995,7 +1032,7 @@ tvheadend.epg = function() {
                    state.filters = {};
                    /* Otherwise this non-resizable column will not expand to newly set width */
                    if (state.columns)
-                       state.columns[0].width = actions.width;
+                       state.columns[0].width = eventdetails.width;
                }
             }
         }

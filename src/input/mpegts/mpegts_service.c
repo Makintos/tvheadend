@@ -26,6 +26,9 @@
 #include "dvb_charset.h"
 #include "config.h"
 #include "epggrab.h"
+#if ENABLE_DDCI
+#include "descrambler/dvbcam.h"
+#endif
 
 /* **************************************************************************
  * Class definition
@@ -193,7 +196,7 @@ const idclass_t mpegts_service_class =
       .id       = "dvb_ignore_eit",
       .name     = N_("Ignore EPG (EIT)"),
       .desc     = N_("Enable or disable ignoring of Event Information "
-                     "Table (EIT) data on this mux."),
+                     "Table (EIT) data for this service."),
       .off      = offsetof(mpegts_service_t, s_dvb_ignore_eit),
       .opts     = PO_EXPERT,
     },
@@ -284,8 +287,12 @@ mpegts_service_is_enabled(service_t *t, int flags)
 static htsmsg_t *
 mpegts_service_config_save ( service_t *t, char *filename, size_t fsize )
 {
-  mpegts_service_t *s = (mpegts_service_t*)t;
-  idnode_changed(&s->s_dvb_mux->mm_id);
+  if (filename == NULL) {
+    htsmsg_t *e = htsmsg_create_map();
+    service_save(t, e);
+    return e;
+  }
+  idnode_changed(&((mpegts_service_t *)t)->s_dvb_mux->mm_id);
   return NULL;
 }
 
@@ -458,7 +465,6 @@ mpegts_service_setsourceinfo(service_t *t, source_info_t *si)
 
   /* Validate */
   assert(s->s_source_type == S_MPEG_TS);
-  lock_assert(&global_lock);
 
   /* Update */
   memset(si, 0, sizeof(struct source_info));
@@ -779,6 +785,10 @@ mpegts_service_create0
 
   /* defaults for older version */
   s->s_dvb_created = dispatch_clock;
+  if (!conf) {
+    if (sid)     s->s_dvb_service_id = sid;
+    if (pmt_pid) s->s_pmt_pid = pmt_pid;
+  }
 
   if (service_create0((service_t*)s, STYPE_STD, class, uuid,
                       S_MPEG_TS, conf) == NULL)
@@ -786,10 +796,7 @@ mpegts_service_create0
 
   /* Create */
   sbuf_init(&s->s_tsbuf);
-  if (!conf) {
-    if (sid)     s->s_dvb_service_id = sid;
-    if (pmt_pid) s->s_pmt_pid        = pmt_pid;
-  } else {
+  if (conf) {
     if (s->s_dvb_last_seen > gclk()) /* sanity check */
       s->s_dvb_last_seen = gclk();
   }
@@ -997,6 +1004,13 @@ mpegts_service_update_slave_pids ( mpegts_service_t *s, int del )
   mpegts_apids_t *pids;
   elementary_stream_t *st;
   int i;
+#if ENABLE_DDCI
+  int is_ddci = dvbcam_is_ddci((service_t*)s);
+#define IS_DDCI  is_ddci
+#else
+#define IS_DDCI  0
+#endif
+
 
   lock_assert(&s->s_stream_mutex);
 
@@ -1010,7 +1024,7 @@ mpegts_service_update_slave_pids ( mpegts_service_t *s, int del )
 
   /* Ensure that filtered PIDs are not send in ts_recv_raw */
   TAILQ_FOREACH(st, &s->s_filt_components, es_filt_link)
-    if ((s->s_scrambled_pass || st->es_type != SCT_CA) &&
+    if ((IS_DDCI || s->s_scrambled_pass || st->es_type != SCT_CA) &&
         st->es_pid >= 0 && st->es_pid < 8192)
       mpegts_pid_add(pids, st->es_pid, mpegts_mps_weight(st));
 
